@@ -53,10 +53,10 @@ export const meta = () => [{ title: "Gold Price Editor" }];
 // ---------------------------------------------------------------------------
 
 export const loader = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const [live, settings, runs] = await Promise.all([
     getLiveGoldPrice(),
-    loadSettings(session.shop),
+    loadSettings(admin, session.shop),
     recentRuns(session.shop),
   ]);
   return json({ live, settings, runs });
@@ -69,12 +69,12 @@ export const action = async ({ request }) => {
 
   try {
     if (body.intent === "save") {
-      const settings = await saveSettings(shop, body.settings);
+      const settings = await saveSettings(admin, shop, body.settings);
       return json({ intent: "save", ok: true, settings });
     }
 
     if (body.intent === "preview") {
-      const settings = await saveSettings(shop, body.settings);
+      const settings = await saveSettings(admin, shop, body.settings);
       const live = await getLiveGoldPrice();
       const prices = karatPrices(live, settings);
       const anyPrice = Object.values(prices.byKarat).some((p) => p.price > 0);

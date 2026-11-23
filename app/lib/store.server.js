@@ -200,57 +200,156 @@ export async function applyPrices(admin, changes) {
 // Settings + history
 // ---------------------------------------------------------------------------
 
-export async function loadSettings(shop) {
-  const row = await db.shopSettings.findUnique({ where: { shop } });
-  if (!row) return normalizeSettings({});
+// Settings are stored in an app-owned shop metafield, so they survive even when the
+// server's disk is wiped (Render's free plan resets the SQLite file on every restart).
+// The database copy is only a backup. Nothing here throws: the dashboard always loads.
+const SETTINGS_QUERY = `#graphql
+  query GoldSettings {
+    shop {
+      id
+      metafield(namespace: "$app", key: "settings") { value }
+    }
+  }
+`;
+
+const SETTINGS_SAVE = `#graphql
+  mutation SaveGoldSettings($metafields: [MetafieldsSetInput!]!) {
+    metafieldsSet(metafields: $metafields) {
+      userErrors { field message }
+    }
+  }
+`;
+
+function parseSettings(text) {
   try {
-    return normalizeSettings(JSON.parse(row.data));
+    return normalizeSettings(JSON.parse(text));
   } catch {
-    return normalizeSettings({});
+    return null;
   }
 }
 
-export async function saveSettings(shop, settings) {
+export async function loadSettings(admin, shop) {
+  try {
+    const data = await gql(admin, SETTINGS_QUERY);
+    const fromShop = data?.shop?.metafield?.value
+      ? parseSettings(data.shop.metafield.value)
+      : null;
+    if (fromShop) return fromShop;
+  } catch (error) {
+    console.error(
+      "[gold-price] could not read settings metafield:",
+      error.message,
+    );
+  }
+  try {
+    const row = await db.shopSettings.findUnique({ where: { shop } });
+    const fromDb = row ? parseSettings(row.data) : null;
+    if (fromDb) return fromDb;
+  } catch (error) {
+    console.error(
+      "[gold-price] could not read settings from database:",
+      error.message,
+    );
+  }
+  return normalizeSettings({});
+}
+
+export async function saveSettings(admin, shop, settings) {
   const clean = normalizeSettings(settings);
-  await db.shopSettings.upsert({
-    where: { shop },
-    create: { shop, data: JSON.stringify(clean) },
-    update: { data: JSON.stringify(clean) },
-  });
+  const value = JSON.stringify(clean);
+  let saved = false;
+  let lastError = null;
+
+  try {
+    const { shop: shopInfo } = await gql(admin, SETTINGS_QUERY);
+    const result = await gql(admin, SETTINGS_SAVE, {
+      metafields: [
+        {
+          ownerId: shopInfo.id,
+          namespace: "$app",
+          key: "settings",
+          type: "json",
+          value,
+        },
+      ],
+    });
+    const errors = result.metafieldsSet.userErrors;
+    if (errors?.length)
+      throw new Error(errors.map((e) => e.message).join(", "));
+    saved = true;
+  } catch (error) {
+    lastError = error;
+    console.error(
+      "[gold-price] could not save settings metafield:",
+      error.message,
+    );
+  }
+
+  try {
+    await db.shopSettings.upsert({
+      where: { shop },
+      create: { shop, data: value },
+      update: { data: value },
+    });
+    saved = true;
+  } catch (error) {
+    lastError = lastError || error;
+    console.error(
+      "[gold-price] could not save settings to database:",
+      error.message,
+    );
+  }
+
+  if (!saved)
+    throw new Error(
+      `Settings could not be saved (${lastError?.message || "unknown error"})`,
+    );
   return clean;
 }
 
 export async function recordRun(shop, run) {
-  return db.priceRun.create({
-    data: {
-      shop,
-      kind: run.kind || "apply",
-      gram24: run.gram24 ?? null,
-      usdPerOunce: run.usdPerOunce ?? null,
-      usdEgp: run.usdEgp ?? null,
-      updatedCount: run.updated.length,
-      failedCount: run.errors.length,
-      changes: JSON.stringify(
-        run.updated.map((u) => ({
-          productId: u.productId,
-          variantId: u.variantId,
-          productTitle: u.productTitle,
-          variantTitle: u.variantTitle || "",
-          oldPrice: u.currentPrice,
-          newPrice: u.newPrice,
-        })),
-      ),
-      errors: run.errors.length ? JSON.stringify(run.errors) : null,
-    },
-  });
+  try {
+    return await db.priceRun.create({
+      data: {
+        shop,
+        kind: run.kind || "apply",
+        gram24: run.gram24 ?? null,
+        usdPerOunce: run.usdPerOunce ?? null,
+        usdEgp: run.usdEgp ?? null,
+        updatedCount: run.updated.length,
+        failedCount: run.errors.length,
+        changes: JSON.stringify(
+          run.updated.map((u) => ({
+            productId: u.productId,
+            variantId: u.variantId,
+            productTitle: u.productTitle,
+            variantTitle: u.variantTitle || "",
+            oldPrice: u.currentPrice,
+            newPrice: u.newPrice,
+          })),
+        ),
+        errors: run.errors.length ? JSON.stringify(run.errors) : null,
+      },
+    });
+  } catch (error) {
+    // Prices were already updated in Shopify; a missing history row must not turn that into an error.
+    console.error("[gold-price] could not record price run:", error.message);
+    return null;
+  }
 }
 
 export async function recentRuns(shop, take = 8) {
-  const rows = await db.priceRun.findMany({
-    where: { shop },
-    orderBy: { createdAt: "desc" },
-    take,
-  });
+  let rows = [];
+  try {
+    rows = await db.priceRun.findMany({
+      where: { shop },
+      orderBy: { createdAt: "desc" },
+      take,
+    });
+  } catch (error) {
+    console.error("[gold-price] could not load price history:", error.message);
+    return [];
+  }
   return rows.map((r) => ({
     id: r.id,
     kind: r.kind,
@@ -263,9 +362,19 @@ export async function recentRuns(shop, take = 8) {
 }
 
 export async function getRun(shop, id) {
-  return db.priceRun.findFirst({ where: { shop, id } });
+  try {
+    return await db.priceRun.findFirst({ where: { shop, id } });
+  } catch (error) {
+    console.error("[gold-price] could not load price run:", error.message);
+    return null;
+  }
 }
 
 export async function markUndone(id) {
-  return db.priceRun.update({ where: { id }, data: { undone: true } });
+  try {
+    return await db.priceRun.update({ where: { id }, data: { undone: true } });
+  } catch (error) {
+    console.error("[gold-price] could not mark run as undone:", error.message);
+    return null;
+  }
 }
