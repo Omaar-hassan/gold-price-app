@@ -1,3 +1,16 @@
+# Gold Price Editor
+
+Shopify app that keeps jewelry prices in sync with the global gold price.
+
+- **Live price**: XAU/USD spot from [gold-api.com](https://gold-api.com) and USD→EGP from [open.er-api.com](https://open.er-api.com), with a daily fallback from currency-api. All free, no API key. Refreshed every 30 seconds on the dashboard.
+- **Price formula**: `(karat price per gram + workmanship per gram) × weight − discount`, rounded. Karat price = 24k price × karat ÷ 24, plus an optional market premium or a manual price per karat.
+- **Preview before applying**: see every old vs new price, skipped products and big changes, pick which to apply, and undo the last run.
+- Product matching rules live in `app/lib/pricing.js` (unit tests: `npm test`).
+
+After pulling, run `npm run setup` (or `npx prisma migrate deploy`) to create the new `ShopSettings` and `PriceRun` tables.
+
+---
+
 # Shopify App Template - Remix
 
 This is a template for building a [Shopify app](https://shopify.dev/docs/apps/getting-started) using the [Remix](https://remix.run) framework.
