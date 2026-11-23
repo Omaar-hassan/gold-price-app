@@ -30,3 +30,28 @@ model Session {
   collaborator  Boolean?  @default(false)
   emailVerified Boolean?  @default(false)
 }
+
+// Pricing settings for each shop (stored as JSON so new options don't need a migration).
+model ShopSettings {
+  shop      String   @id
+  data      String
+  updatedAt DateTime @updatedAt
+}
+
+// One row per "Apply prices" run. `changes` keeps old and new prices so a run can be undone.
+model PriceRun {
+  id           Int      @id @default(autoincrement())
+  shop         String
+  createdAt    DateTime @default(now())
+  kind         String   @default("apply")
+  gram24       Float?
+  usdPerOunce  Float?
+  usdEgp       Float?
+  updatedCount Int      @default(0)
+  failedCount  Int      @default(0)
+  changes      String
+  errors       String?
+  undone       Boolean  @default(false)
+
+  @@index([shop, createdAt])
+}
