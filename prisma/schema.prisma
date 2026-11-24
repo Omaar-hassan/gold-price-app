@@ -59,3 +59,18 @@ model PriceRun {
 
   @@index([shop, createdAt])
 }
+
+// The price plan shown in a preview. "Apply" reads the prices from here (not from the
+// browser), and appliedAt makes sure one preview can only be applied once.
+model PricePreview {
+  id          String    @id @default(cuid())
+  shop        String
+  createdAt   DateTime  @default(now())
+  gram24      Float?
+  usdPerOunce Float?
+  usdEgp      Float?
+  rows        String
+  appliedAt   DateTime?
+
+  @@index([shop, createdAt])
+}

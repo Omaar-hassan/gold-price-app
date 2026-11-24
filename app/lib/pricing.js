@@ -423,3 +423,28 @@ export function buildPlan(products, settings, prices) {
 
   return { rows, skipped };
 }
+
+/**
+ * Split changes into ones that are safe to write and ones whose price in Shopify is no
+ * longer what we expect (someone edited it by hand, or the variant was deleted).
+ * expectedKey: the field holding the price we expect to find in Shopify right now.
+ */
+export function splitByCurrentPrice(changes, currentPrices, expectedKey) {
+  const safe = [];
+  const skipped = [];
+  for (const c of changes) {
+    const current = currentPrices.get(c.variantId);
+    if (current === undefined) {
+      skipped.push({ ...c, reason: "Variant no longer exists" });
+    } else if (Math.abs(current - Number(c[expectedKey])) >= 0.005) {
+      skipped.push({
+        ...c,
+        actualPrice: current,
+        reason: "Price was changed in Shopify since",
+      });
+    } else {
+      safe.push(c);
+    }
+  }
+  return { safe, skipped };
+}

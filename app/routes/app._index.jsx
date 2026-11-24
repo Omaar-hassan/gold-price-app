@@ -29,13 +29,17 @@ import { authenticate } from "../shopify.server";
 import { getLiveGoldPrice } from "../lib/goldPrice.server";
 import {
   applyPrices,
+  claimPreview,
   fetchAllProducts,
+  fetchVariantPrices,
   getRun,
   loadSettings,
   markUndone,
   recentRuns,
   recordRun,
+  savePreview,
   saveSettings,
+  splitByCurrentPrice,
 } from "../lib/store.server";
 import {
   KARATS,
@@ -91,60 +95,72 @@ export const action = async ({ request }) => {
       const products = await fetchAllProducts(admin);
       const images = Object.fromEntries(products.map((p) => [p.id, p.image]));
       const plan = buildPlan(products, settings, prices);
+      const snapshot = {
+        gram24: prices.gram24,
+        usdPerOunce: prices.usdPerOunce,
+        usdEgp: prices.usdEgp,
+        byKarat: prices.byKarat,
+        at: new Date().toISOString(),
+      };
+      const previewId = await savePreview(shop, snapshot, plan.rows);
       return json({
         intent: "preview",
         ok: true,
+        previewId,
         productCount: products.length,
         rows: plan.rows.map((r) => ({
           ...r,
           image: images[r.productId] || null,
         })),
         skipped: plan.skipped,
-        snapshot: {
-          gram24: prices.gram24,
-          usdPerOunce: prices.usdPerOunce,
-          usdEgp: prices.usdEgp,
-          byKarat: prices.byKarat,
-          at: new Date().toISOString(),
-        },
+        snapshot,
       });
     }
 
     if (body.intent === "apply") {
-      const changes = (body.changes || [])
-        .map((c) => ({
-          productId: String(c.productId),
-          variantId: String(c.variantId),
-          productTitle: String(c.productTitle || ""),
-          variantTitle: String(c.variantTitle || ""),
-          currentPrice: toNumber(c.currentPrice, 0),
-          newPrice: Math.round(toNumber(c.newPrice, 0) * 100) / 100,
-        }))
-        .filter(
-          (c) =>
-            c.productId.startsWith("gid://shopify/Product/") &&
-            c.variantId.startsWith("gid://shopify/ProductVariant/") &&
-            c.newPrice > 0,
-        );
-      if (!changes.length)
+      // Prices come from the preview saved on the server, never from the browser.
+      const wanted = new Set((body.variantIds || []).map(String));
+      if (!wanted.size)
         return json(
           { intent: "apply", error: "Nothing selected to update." },
           { status: 400 },
         );
+      const claim = await claimPreview(shop, String(body.previewId || ""));
+      if (claim.error)
+        return json({ intent: "apply", error: claim.error }, { status: 409 });
+      const { preview } = claim;
+      const changes = preview.rows.filter(
+        (r) => wanted.has(r.variantId) && toNumber(r.newPrice, 0) > 0,
+      );
+      // Skip variants whose price was edited in Shopify after the preview.
+      const current = await fetchVariantPrices(
+        admin,
+        changes.map((c) => c.variantId),
+      );
+      const { safe, skipped } = splitByCurrentPrice(
+        changes,
+        current,
+        "currentPrice",
+      );
 
-      const result = await applyPrices(admin, changes);
-      await recordRun(shop, {
-        kind: "apply",
-        gram24: toNumber(body.snapshot?.gram24, null),
-        usdPerOunce: toNumber(body.snapshot?.usdPerOunce, null),
-        usdEgp: toNumber(body.snapshot?.usdEgp, null),
-        ...result,
-      });
+      const result = safe.length
+        ? await applyPrices(admin, safe)
+        : { updated: [], errors: [] };
+      if (result.updated.length || result.errors.length) {
+        await recordRun(shop, {
+          kind: "apply",
+          gram24: preview.gram24,
+          usdPerOunce: preview.usdPerOunce,
+          usdEgp: preview.usdEgp,
+          ...result,
+        });
+      }
       return json({
         intent: "apply",
         ok: true,
         updatedCount: result.updated.length,
         errors: result.errors,
+        skipped,
         runs: await recentRuns(shop),
       });
     }
@@ -161,14 +177,29 @@ export const action = async ({ request }) => {
       const changes = original
         .filter((c) => toNumber(c.oldPrice, 0) > 0)
         .map((c) => ({ ...c, currentPrice: c.newPrice, newPrice: c.oldPrice }));
-      const result = await applyPrices(admin, changes);
-      await recordRun(shop, { kind: "undo", ...result });
+      // Only restore prices that are still what this run set. A price edited by hand
+      // afterwards is left alone and reported.
+      const current = await fetchVariantPrices(
+        admin,
+        changes.map((c) => c.variantId),
+      );
+      const { safe, skipped } = splitByCurrentPrice(
+        changes,
+        current,
+        "currentPrice",
+      );
+      const result = safe.length
+        ? await applyPrices(admin, safe)
+        : { updated: [], errors: [] };
+      if (result.updated.length || result.errors.length)
+        await recordRun(shop, { kind: "undo", ...result });
       if (!result.errors.length) await markUndone(run.id);
       return json({
         intent: "undo",
         ok: true,
         updatedCount: result.updated.length,
         errors: result.errors,
+        skipped,
         runs: await recentRuns(shop),
       });
     }
@@ -564,10 +595,24 @@ export default function Dashboard() {
     }
     if (d.intent === "apply" || d.intent === "undo") {
       const verb = d.intent === "apply" ? "Updated" : "Restored";
+      const skippedCount = d.skipped?.length || 0;
       setNotice({
-        tone: d.errors?.length ? "warning" : "success",
-        title: `${verb} ${d.updatedCount} variant price${d.updatedCount === 1 ? "" : "s"}.`,
-        errors: d.errors,
+        tone: d.errors?.length || skippedCount ? "warning" : "success",
+        title:
+          `${verb} ${d.updatedCount} variant price${d.updatedCount === 1 ? "" : "s"}.` +
+          (skippedCount
+            ? ` ${skippedCount} skipped because the price was changed in Shopify after the ${d.intent === "apply" ? "preview" : "update"}.`
+            : ""),
+        errors: [
+          ...(d.errors || []),
+          ...(d.skipped || []).map((s) => ({
+            productId: s.variantId,
+            productTitle: s.variantTitle
+              ? `${s.productTitle} (${s.variantTitle})`
+              : s.productTitle,
+            message: s.reason,
+          })),
+        ],
       });
       if (d.runs) setRuns(d.runs);
       setPreview(null);
@@ -747,15 +792,8 @@ export default function Dashboard() {
                       onAction: () =>
                         submit({
                           intent: "apply",
-                          snapshot: preview.snapshot,
-                          changes: selectedRows.map((r) => ({
-                            productId: r.productId,
-                            variantId: r.variantId,
-                            productTitle: r.productTitle,
-                            variantTitle: r.variantTitle,
-                            currentPrice: r.currentPrice,
-                            newPrice: r.newPrice,
-                          })),
+                          previewId: preview.previewId,
+                          variantIds: selectedRows.map((r) => r.variantId),
                         }),
                     }}
                     secondaryAction={{
