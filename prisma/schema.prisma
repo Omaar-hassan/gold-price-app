@@ -31,6 +31,8 @@ model Session {
   locale        String?
   collaborator  Boolean?  @default(false)
   emailVerified Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
 }
 
 // Pricing settings for each shop (stored as JSON so new options don't need a migration).

@@ -43,7 +43,7 @@ const PRODUCTS_QUERY = `#graphql
         status
         productType
         tags
-        featuredImage { url(transform: { maxWidth: 80, maxHeight: 80 }) }
+        featuredMedia { preview { image { url(transform: { maxWidth: 80, maxHeight: 80 }) } } }
         metafields(first: 15) { nodes { namespace key value } }
         variants(first: 25) {
           pageInfo { hasNextPage }
@@ -129,7 +129,7 @@ export async function fetchAllProducts(admin) {
         status: p.status,
         productType: p.productType,
         tags: p.tags || [],
-        image: p.featuredImage?.url || null,
+        image: p.featuredMedia?.preview?.image?.url || null,
         metafields: p.metafields.nodes.map((m) => ({
           namespace: m.namespace,
           key: m.key,
