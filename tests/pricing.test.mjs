@@ -9,6 +9,7 @@ import {
   normalizeKarat,
   normalizeSettings,
   originFromText,
+  splitByCurrentPrice,
   weightFromMetafield,
   weightFromSku,
   weightWithUnit,
@@ -179,4 +180,32 @@ test("buildPlan prices, skips and flags", () => {
   assert.equal(assumeLocal.rows.length, 3);
   assert.equal(assumeLocal.rows[2].originGuessed, true);
   assert.equal(assumeLocal.rows[2].flagged, true);
+});
+
+test("only changes whose Shopify price is unchanged are safe to write", () => {
+  const changes = [
+    { variantId: "v1", currentPrice: 1000, newPrice: 1100 },
+    { variantId: "v2", currentPrice: 2000, newPrice: 2100 },
+    { variantId: "v3", currentPrice: 3000, newPrice: 3100 },
+  ];
+  const current = new Map([
+    ["v1", 1000],
+    ["v2", 2050],
+  ]);
+  const { safe, skipped } = splitByCurrentPrice(
+    changes,
+    current,
+    "currentPrice",
+  );
+  assert.deepEqual(
+    safe.map((c) => c.variantId),
+    ["v1"],
+  );
+  assert.deepEqual(
+    skipped.map((c) => [c.variantId, c.reason]),
+    [
+      ["v2", "Price was changed in Shopify since"],
+      ["v3", "Variant no longer exists"],
+    ],
+  );
 });

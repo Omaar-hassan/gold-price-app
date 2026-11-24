@@ -2,6 +2,8 @@
 import db from "../db.server";
 import { normalizeSettings } from "./pricing";
 
+export { splitByCurrentPrice } from "./pricing";
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function isThrottled(error) {
@@ -194,6 +196,88 @@ export async function applyPrices(admin, changes) {
     }
   }
   return { updated, errors };
+}
+
+const VARIANT_PRICES_QUERY = `#graphql
+  query VariantPrices($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on ProductVariant { id price }
+    }
+  }
+`;
+
+/** Current price of each variant, straight from Shopify. Returns Map(variantId -> number). */
+export async function fetchVariantPrices(admin, variantIds) {
+  const prices = new Map();
+  const ids = [...new Set(variantIds)];
+  for (let i = 0; i < ids.length; i += 250) {
+    const data = await gql(admin, VARIANT_PRICES_QUERY, {
+      ids: ids.slice(i, i + 250),
+    });
+    for (const node of data.nodes || []) {
+      if (node?.id) prices.set(node.id, Number(node.price));
+    }
+  }
+  return prices;
+}
+
+// ---------------------------------------------------------------------------
+// Previews
+// ---------------------------------------------------------------------------
+
+export const PREVIEW_MAX_AGE_MS = 60 * 60 * 1000;
+
+export async function savePreview(shop, snapshot, rows) {
+  try {
+    // Old previews are only needed for a short while.
+    await db.pricePreview.deleteMany({
+      where: { createdAt: { lt: new Date(Date.now() - 24 * 60 * 60 * 1000) } },
+    });
+  } catch (error) {
+    console.error("[gold-price] could not clean old previews:", error.message);
+  }
+  const preview = await db.pricePreview.create({
+    data: {
+      shop,
+      gram24: snapshot.gram24 || null,
+      usdPerOunce: snapshot.usdPerOunce || null,
+      usdEgp: snapshot.usdEgp || null,
+      rows: JSON.stringify(
+        rows.map((r) => ({
+          productId: r.productId,
+          variantId: r.variantId,
+          productTitle: r.productTitle,
+          variantTitle: r.variantTitle || "",
+          currentPrice: r.currentPrice,
+          newPrice: r.newPrice,
+        })),
+      ),
+    },
+  });
+  return preview.id;
+}
+
+/**
+ * Claim a preview for applying. Returns { preview } or { error }.
+ * The claim is atomic, so a double click or a second tab can't apply it twice.
+ */
+export async function claimPreview(shop, id) {
+  const preview = await db.pricePreview.findFirst({ where: { shop, id } });
+  if (!preview)
+    return { error: "This preview was not found. Run Preview again." };
+  if (preview.appliedAt) return { error: "These prices were already applied." };
+  if (Date.now() - preview.createdAt.getTime() > PREVIEW_MAX_AGE_MS)
+    return {
+      error:
+        "This preview is more than an hour old. Run Preview again to use the latest gold price.",
+    };
+  const claimed = await db.pricePreview.updateMany({
+    where: { id, shop, appliedAt: null },
+    data: { appliedAt: new Date() },
+  });
+  if (claimed.count !== 1)
+    return { error: "These prices were already applied." };
+  return { preview: { ...preview, rows: JSON.parse(preview.rows) } };
 }
 
 // ---------------------------------------------------------------------------
