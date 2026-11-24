@@ -7,7 +7,14 @@ Shopify app that keeps jewelry prices in sync with the global gold price.
 - **Preview before applying**: see every old vs new price, skipped products and big changes, pick which to apply, and undo the last run.
 - Product matching rules live in `app/lib/pricing.js` (unit tests: `npm test`).
 
-After pulling, run `npm run setup` (or `npx prisma migrate deploy`) to create the new `ShopSettings` and `PriceRun` tables.
+## Database
+
+The app uses PostgreSQL ([Neon](https://neon.tech) in production) through Prisma.
+
+- Set `DATABASE_URL` to your Neon connection string (Neon dashboard, **Connect**). Add `?sslmode=require&connect_timeout=15` if it is not already there; the timeout gives a sleeping Neon database time to wake up.
+- Production (Render): add `DATABASE_URL` under **Environment**. `npm run start` applies any new migrations before the server starts.
+- Local development: put `DATABASE_URL=...` in a `.env` file (never commit it). A separate Neon branch, or a local PostgreSQL, keeps test data away from production.
+- Pricing settings are also stored in a Shopify shop metafield, so they survive a database reset.
 
 ---
 
