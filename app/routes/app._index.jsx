@@ -26,7 +26,7 @@ import {
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
-import { getLiveGoldPrice } from "../lib/goldPrice.server";
+import { getLiveGoldPrice, recentRates } from "../lib/goldPrice.server";
 import {
   applyPrices,
   claimPreview,
@@ -42,8 +42,9 @@ import {
   splitByCurrentPrice,
 } from "../lib/store.server";
 import {
-  KARATS,
   ORIGIN_LABELS,
+  PURITIES,
+  purityLabel,
   buildPlan,
   karatPrices,
   normalizeSettings,
@@ -58,12 +59,13 @@ export const meta = () => [{ title: "Gold Price Editor" }];
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
-  const [live, settings, runs] = await Promise.all([
+  const [live, settings, runs, history] = await Promise.all([
     getLiveGoldPrice(),
     loadSettings(admin, session.shop),
     recentRuns(session.shop),
+    recentRates(14),
   ]);
-  return json({ live, settings, runs });
+  return json({ live, settings, runs, history });
 };
 
 export const action = async ({ request }) => {
@@ -274,6 +276,7 @@ const STYLES = `
   .gpe-downtxt { color: #fca5a5; font-weight: 600; }
   .gpe-karat { border: 1px solid var(--p-color-border); border-radius: 12px; padding: 14px; background: var(--p-color-bg-surface); }
   .gpe-karat-k { font-size: 13px; font-weight: 600; color: #8a6d1d; }
+  .gpe-karat-k.silver { color: #5f6b7a; }
   .gpe-karat-p { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .gpe-scroll { overflow-x: auto; margin: 0 -4px; }
   .gpe-matrix { width: 100%; min-width: 520px; border-collapse: collapse; }
@@ -283,7 +286,16 @@ const STYLES = `
   .gpe-num { font-variant-numeric: tabular-nums; }
 `;
 
-function LiveHero({ live, gram24, usdEgp, now, trend, onRefresh, refreshing }) {
+function LiveHero({
+  live,
+  gram24,
+  gramSilver,
+  usdEgp,
+  now,
+  trend,
+  onRefresh,
+  refreshing,
+}) {
   const status = !live.ok
     ? "down"
     : live.gold.stale || live.fx.stale
@@ -305,7 +317,7 @@ function LiveHero({ live, gram24, usdEgp, now, trend, onRefresh, refreshing }) {
           </Button>
         </InlineStack>
 
-        <InlineGrid columns={{ xs: 1, md: 3 }} gap="400">
+        <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="400">
           <BlockStack gap="100">
             <span className="gpe-hero-label">24k gold · per gram</span>
             <span className="gpe-hero-price">
@@ -319,6 +331,19 @@ function LiveHero({ live, gram24, usdEgp, now, trend, onRefresh, refreshing }) {
             ) : (
               <span className="gpe-hero-sub">Includes your market premium</span>
             )}
+          </BlockStack>
+          <BlockStack gap="100">
+            <span className="gpe-hero-label">Fine silver · per gram</span>
+            <span className="gpe-hero-price" style={{ fontSize: 28 }}>
+              {gramSilver > 0 ? egp.format(gramSilver) : "—"}
+            </span>
+            <span className="gpe-hero-sub">
+              {live.silverUsdPerOunce
+                ? `${usd.format(live.silverUsdPerOunce)} /oz (XAG)`
+                : live.silver?.error
+                  ? "Silver price unavailable"
+                  : "—"}
+            </span>
           </BlockStack>
           <BlockStack gap="100">
             <span className="gpe-hero-label">Global spot (XAU/USD)</span>
@@ -345,37 +370,74 @@ function LiveHero({ live, gram24, usdEgp, now, trend, onRefresh, refreshing }) {
 }
 
 function KaratCards({ prices, settings }) {
+  const card = (p) => {
+    const price = prices.byKarat[p.key];
+    const included = settings.includeKarats.includes(p.key);
+    return (
+      <div
+        className="gpe-karat"
+        key={p.key}
+        style={{ opacity: included ? 1 : 0.55 }}
+      >
+        <BlockStack gap="100">
+          <InlineStack align="space-between" blockAlign="center">
+            <span className={`gpe-karat-k ${p.metal}`}>{p.label}</span>
+            {price.source === "manual" ? (
+              <Badge tone="attention">Manual</Badge>
+            ) : (
+              <Badge tone="success">Live</Badge>
+            )}
+          </InlineStack>
+          <span className="gpe-karat-p">
+            {price.price > 0 ? egp0.format(price.price) : "—"}
+          </span>
+          <Text as="span" variant="bodySm" tone="subdued">
+            per gram · {Math.round(p.fraction * 1000) / 10}% {p.metal}
+          </Text>
+        </BlockStack>
+      </div>
+    );
+  };
   return (
-    <InlineGrid columns={{ xs: 2, sm: 3, md: 5 }} gap="300">
-      {KARATS.map((k) => {
-        const p = prices.byKarat[k];
-        const included = settings.includeKarats.includes(k);
-        return (
-          <div
-            className="gpe-karat"
-            key={k}
-            style={{ opacity: included ? 1 : 0.55 }}
-          >
-            <BlockStack gap="100">
-              <InlineStack align="space-between" blockAlign="center">
-                <span className="gpe-karat-k">{k}k</span>
-                {p.source === "manual" ? (
-                  <Badge tone="attention">Manual</Badge>
-                ) : (
-                  <Badge tone="success">Live</Badge>
-                )}
-              </InlineStack>
-              <span className="gpe-karat-p">
-                {p.price > 0 ? egp0.format(p.price) : "—"}
-              </span>
-              <Text as="span" variant="bodySm" tone="subdued">
-                per gram · {Math.round((Number(k) / 24) * 1000) / 10}% gold
-              </Text>
-            </BlockStack>
-          </div>
-        );
-      })}
-    </InlineGrid>
+    <BlockStack gap="300">
+      <InlineGrid columns={{ xs: 2, sm: 4, md: 7 }} gap="300">
+        {PURITIES.filter((p) => p.metal === "gold").map(card)}
+      </InlineGrid>
+      <InlineGrid columns={{ xs: 2, sm: 4, md: 7 }} gap="300">
+        {PURITIES.filter((p) => p.metal === "silver").map(card)}
+      </InlineGrid>
+    </BlockStack>
+  );
+}
+
+function RateHistory({ history }) {
+  if (!history?.length)
+    return (
+      <Text as="p" tone="subdued">
+        Prices are saved once a day while the app is open. Check back tomorrow.
+      </Text>
+    );
+  return (
+    <div className="gpe-scroll">
+      <table className="gpe-matrix" style={{ minWidth: 0 }}>
+        <thead>
+          <tr>
+            <th>Day</th>
+            <th>24k / g</th>
+            <th>Silver 999 / g</th>
+          </tr>
+        </thead>
+        <tbody>
+          {history.map((h) => (
+            <tr key={h.day}>
+              <td>{h.day}</td>
+              <td>{h.gold ? egp0.format(h.gold) : "—"}</td>
+              <td>{h.silver ? egp.format(h.silver) : "—"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -444,7 +506,7 @@ function PreviewTable({ rows, selected, onSelect }) {
               </BlockStack>
             </InlineStack>
           </IndexTable.Cell>
-          <IndexTable.Cell>{r.karat}k</IndexTable.Cell>
+          <IndexTable.Cell>{purityLabel(r.karat)}</IndexTable.Cell>
           <IndexTable.Cell>
             {ORIGIN_LABELS[r.origin]}
             {r.originGuessed && (
@@ -523,7 +585,9 @@ function SkippedTable({ skipped }) {
           <IndexTable.Cell>
             <Badge tone="warning">{r.reason}</Badge>
           </IndexTable.Cell>
-          <IndexTable.Cell>{r.karat ? `${r.karat}k` : "—"}</IndexTable.Cell>
+          <IndexTable.Cell>
+            {r.karat ? purityLabel(r.karat) : "—"}
+          </IndexTable.Cell>
           <IndexTable.Cell>
             {r.origin ? ORIGIN_LABELS[r.origin] : "—"}
           </IndexTable.Cell>
@@ -686,6 +750,7 @@ export default function Dashboard() {
         <LiveHero
           live={live}
           gram24={prices.gram24}
+          gramSilver={prices.gramSilver}
           usdEgp={prices.usdEgp}
           now={now}
           trend={trend}
@@ -851,22 +916,31 @@ export default function Dashboard() {
                 <BlockStack gap="400">
                   <BlockStack gap="100">
                     <Text as="h2" variant="headingMd">
-                      Gold price
+                      Metal prices
                     </Text>
                     <Text as="p" tone="subdued">
-                      Prices come from the global spot price, converted to EGP
-                      per gram. Leave a karat empty to use the live price, or
-                      type a price to fix it manually.
+                      Prices come from the global gold and silver spot prices,
+                      converted to EGP per gram. Leave a price empty to use the
+                      live price, or type a price to fix it manually.
                     </Text>
                   </BlockStack>
-                  <InlineGrid columns={{ xs: 1, sm: 2 }} gap="300">
+                  <InlineGrid columns={{ xs: 1, sm: 3 }} gap="300">
                     <TextField
-                      label="Market premium"
+                      label="Gold market premium"
                       type="number"
                       suffix="%"
                       value={String(settings.premiumPct)}
                       onChange={(v) => set("premiumPct", v)}
                       helpText="Added to the spot price to match the local market. Can be negative."
+                      autoComplete="off"
+                    />
+                    <TextField
+                      label="Silver market premium"
+                      type="number"
+                      suffix="%"
+                      value={String(settings.silverPremiumPct)}
+                      onChange={(v) => set("silverPremiumPct", v)}
+                      helpText="Same, for silver."
                       autoComplete="off"
                     />
                     <TextField
@@ -888,7 +962,7 @@ export default function Dashboard() {
                     <table className="gpe-matrix">
                       <thead>
                         <tr>
-                          <th>Karat</th>
+                          <th>Purity</th>
                           <th>Update</th>
                           <th>Price / g (empty = live)</th>
                           <th>Workmanship / g · local</th>
@@ -896,16 +970,16 @@ export default function Dashboard() {
                         </tr>
                       </thead>
                       <tbody>
-                        {KARATS.map((k) => (
+                        {PURITIES.map(({ key: k, label }) => (
                           <tr key={k}>
                             <td>
                               <Text as="span" fontWeight="semibold">
-                                {k}k
+                                {label}
                               </Text>
                             </td>
                             <td>
                               <Checkbox
-                                label={`Update ${k}k products`}
+                                label={`Update ${label} products`}
                                 labelHidden
                                 checked={settings.includeKarats.includes(k)}
                                 onChange={(on) => toggleKarat(k, on)}
@@ -913,16 +987,16 @@ export default function Dashboard() {
                             </td>
                             <td>
                               <TextField
-                                label={`${k}k price per gram`}
+                                label={`${label} price per gram`}
                                 labelHidden
                                 type="number"
                                 value={settings.karatOverrides[k]}
                                 placeholder={
-                                  prices.gram24 > 0
+                                  prices.byKarat[k].livePrice > 0
                                     ? num.format(
                                         Math.round(
-                                          (prices.gram24 * Number(k)) / 24,
-                                        ),
+                                          prices.byKarat[k].livePrice * 100,
+                                        ) / 100,
                                       )
                                     : "Manual"
                                 }
@@ -932,7 +1006,7 @@ export default function Dashboard() {
                             </td>
                             <td>
                               <TextField
-                                label={`${k}k local workmanship`}
+                                label={`${label} local workmanship`}
                                 labelHidden
                                 type="number"
                                 value={String(settings.making[k].local)}
@@ -942,7 +1016,7 @@ export default function Dashboard() {
                             </td>
                             <td>
                               <TextField
-                                label={`${k}k imported workmanship`}
+                                label={`${label} imported workmanship`}
                                 labelHidden
                                 type="number"
                                 value={String(settings.making[k].imported)}
@@ -1050,7 +1124,8 @@ export default function Dashboard() {
                   </Box>
                   <Text as="p" variant="bodySm" tone="subdued">
                     Karat price = 24k price × karat ÷ 24. 24k price = spot
-                    USD/oz ÷ 31.1035 × USD→EGP × (1 + premium).
+                    USD/oz ÷ 31.1035 × USD→EGP × (1 + premium). Silver works the
+                    same way: 925 = 92.5% of the fine silver (999) price.
                   </Text>
                 </BlockStack>
               </Card>
@@ -1112,6 +1187,18 @@ export default function Dashboard() {
 
               <Card>
                 <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Market prices, last 14 days
+                  </Text>
+                  <Text as="p" variant="bodySm" tone="subdued">
+                    Pure metal per gram in EGP, before your premium.
+                  </Text>
+                  <RateHistory history={data.history} />
+                </BlockStack>
+              </Card>
+
+              <Card>
+                <BlockStack gap="300">
                   <InlineStack align="space-between" blockAlign="center">
                     <Text as="h2" variant="headingMd">
                       How products are matched
@@ -1129,6 +1216,13 @@ export default function Dashboard() {
                         <strong>Karat</strong>: metafield <code>karat</code>,
                         then the title, tags, product type or SKU (e.g. “21k”,
                         “21 karat”, “عيار 21”).
+                      </Text>
+                      <Text as="p" variant="bodySm">
+                        <strong>Silver</strong>: a product is silver when its{" "}
+                        <code>metal</code> metafield, title, tags, type or SKU
+                        says “silver”, “sterling” or “فضة”, or carries the 925
+                        hallmark. The purity (925 or 999) is read from the{" "}
+                        <code>purity</code> metafield, then the same places.
                       </Text>
                       <Text as="p" variant="bodySm">
                         <strong>Origin</strong>: metafield <code>origin</code>,

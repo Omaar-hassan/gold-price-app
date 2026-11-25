@@ -74,3 +74,19 @@ model PricePreview {
 
   @@index([shop, createdAt])
 }
+
+// Daily market price history, shared by all stores (market data, not store data).
+// One row per metal per day (Cairo date), holding the last price seen that day.
+model MetalRate {
+  id          Int      @id @default(autoincrement())
+  metal       String
+  day         String
+  usdPerOunce Float
+  usdEgp      Float
+  egpPerGram  Float
+  source      String
+  updatedAt   DateTime @updatedAt
+
+  @@unique([metal, day])
+  @@index([day])
+}

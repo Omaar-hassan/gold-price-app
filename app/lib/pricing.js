@@ -3,31 +3,83 @@
 
 export const TROY_OUNCE_GRAMS = 31.1034768;
 
-export const KARATS = ["24", "22", "21", "18", "14"];
+// ---------------------------------------------------------------------------
+// Metals and purities
+// ---------------------------------------------------------------------------
+//
+// Every purity the app can price. To support a new one, add ONE line here:
+// detection, settings, dashboard cards and pricing all read from this list.
+//   key:      id used in settings and the preview ("21", "S925")
+//   metal:    which live spot price it uses ("gold" -> XAU, "silver" -> XAG)
+//   fraction: share of the pure-metal price per gram. Like 24K gold, fine silver
+//             (999) is priced at the full spot price.
+//   codes:    (silver) hallmark numbers recognised in titles, tags, SKUs, metafields
+export const METALS = {
+  gold: { label: "Gold", symbol: "XAU" },
+  silver: { label: "Silver", symbol: "XAG" },
+};
+
+export const PURITIES = [
+  { key: "24", metal: "gold", label: "24k", fraction: 24 / 24 },
+  { key: "22", metal: "gold", label: "22k", fraction: 22 / 24 },
+  { key: "21", metal: "gold", label: "21k", fraction: 21 / 24 },
+  { key: "18", metal: "gold", label: "18k", fraction: 18 / 24 },
+  { key: "14", metal: "gold", label: "14k", fraction: 14 / 24 },
+  { key: "10", metal: "gold", label: "10k", fraction: 10 / 24 },
+  { key: "9", metal: "gold", label: "9k", fraction: 9 / 24 },
+  {
+    key: "S999",
+    metal: "silver",
+    label: "Silver 999",
+    fraction: 1,
+    codes: ["999"],
+  },
+  {
+    key: "S925",
+    metal: "silver",
+    label: "Silver 925",
+    fraction: 0.925,
+    codes: ["925"],
+    words: ["sterling"],
+  },
+];
+
+export const PURITY_KEYS = PURITIES.map((p) => p.key);
+export const PURITY_BY_KEY = Object.fromEntries(
+  PURITIES.map((p) => [p.key, p]),
+);
+export const purityLabel = (key) =>
+  PURITY_BY_KEY[key]?.label || (key ? `${key}k` : "");
+
+// Gold karats only (kept for detection and older code).
+export const KARATS = PURITIES.filter((p) => p.metal === "gold").map(
+  (p) => p.key,
+);
+export const SILVER_KEYS = PURITIES.filter((p) => p.metal === "silver").map(
+  (p) => p.key,
+);
 export const ORIGINS = ["local", "imported"];
 export const ORIGIN_LABELS = { local: "Local", imported: "Imported" };
 
 export const DEFAULT_SETTINGS = {
   // Extra % added on top of the global spot price (local market premium). Can be negative.
   premiumPct: 0,
+  // Same for silver.
+  silverPremiumPct: 0,
   // Optional manual USD -> EGP rate. Empty = use the live rate.
   usdEgpOverride: "",
-  // Optional manual price per gram for a karat (EGP). Empty = derive from the live 24k price.
-  karatOverrides: { 24: "", 22: "", 21: "", 18: "", 14: "" },
-  // Workmanship (making charge) in EGP per gram, by karat and origin.
-  making: {
-    24: { local: 0, imported: 0 },
-    22: { local: 0, imported: 0 },
-    21: { local: 0, imported: 0 },
-    18: { local: 0, imported: 0 },
-    14: { local: 0, imported: 0 },
-  },
+  // Optional manual price per gram for a purity (EGP). Empty = derive from the live spot price.
+  karatOverrides: Object.fromEntries(PURITY_KEYS.map((k) => [k, ""])),
+  // Workmanship (making charge) in EGP per gram, by purity and origin.
+  making: Object.fromEntries(
+    PURITY_KEYS.map((k) => [k, { local: 0, imported: 0 }]),
+  ),
   // Flat discount taken off each piece (EGP).
   discountPerPiece: 0,
   // Round the final price to the nearest N EGP. "0.01" = no rounding.
   rounding: "1",
-  // Which karats to update.
-  includeKarats: ["24", "22", "21", "18", "14"],
+  // Which purities to update.
+  includeKarats: [...PURITY_KEYS],
   // What to do with products whose origin can't be detected: "skip" | "local" | "imported".
   unknownOrigin: "skip",
   // Changes larger than this % are flagged in the preview.
@@ -48,7 +100,7 @@ export function normalizeSettings(input = {}) {
   const s = { ...DEFAULT_SETTINGS, ...input };
   const making = {};
   const karatOverrides = {};
-  for (const k of KARATS) {
+  for (const k of PURITY_KEYS) {
     const m = (input.making && input.making[k]) || {};
     making[k] = {
       local: Math.max(0, toNumber(m.local, 0)),
@@ -61,11 +113,12 @@ export function normalizeSettings(input = {}) {
         : String(Math.max(0, toNumber(o, 0)));
   }
   const includeKarats = Array.isArray(input.includeKarats)
-    ? input.includeKarats.map(String).filter((k) => KARATS.includes(k))
+    ? input.includeKarats.map(String).filter((k) => PURITY_KEYS.includes(k))
     : DEFAULT_SETTINGS.includeKarats;
   const usd = input.usdEgpOverride;
   return {
     premiumPct: toNumber(s.premiumPct, 0),
+    silverPremiumPct: toNumber(s.silverPremiumPct, 0),
     usdEgpOverride:
       usd === "" || usd === null || usd === undefined
         ? ""
@@ -85,34 +138,54 @@ export function normalizeSettings(input = {}) {
 }
 
 /**
- * Price per gram in EGP for every karat.
- * live: { usdPerOunce, usdEgp } from the price service (may be null if offline).
- * Returns { gram24, byKarat: { "21": { price, source } }, usdEgp, usdPerOunce }.
+ * Price per gram in EGP for every purity.
+ * live: { usdPerOunce, silverUsdPerOunce, usdEgp } from the price service (may be null if offline).
+ * Returns { gram24, gramSilver, byKarat: { "21": { price, livePrice, source } }, usdEgp, usdPerOunce, silverUsdPerOunce }.
+ * gram24 / gramSilver = price per gram of the pure metal, premium included.
  */
 export function karatPrices(live, settings) {
   const usdEgp = settings.usdEgpOverride
     ? toNumber(settings.usdEgpOverride)
     : toNumber(live?.usdEgp, 0);
-  const usdPerOunce = toNumber(live?.usdPerOunce, 0);
-  const premium = 1 + toNumber(settings.premiumPct, 0) / 100;
-  const gram24 =
-    usdPerOunce > 0 && usdEgp > 0
-      ? (usdPerOunce / TROY_OUNCE_GRAMS) * usdEgp * premium
-      : 0;
+  const spot = {
+    gold: toNumber(live?.usdPerOunce, 0),
+    silver: toNumber(live?.silverUsdPerOunce, 0),
+  };
+  const premium = {
+    gold: 1 + toNumber(settings.premiumPct, 0) / 100,
+    silver: 1 + toNumber(settings.silverPremiumPct, 0) / 100,
+  };
+  const pureGram = {};
+  for (const metal of Object.keys(METALS)) {
+    pureGram[metal] =
+      spot[metal] > 0 && usdEgp > 0
+        ? (spot[metal] / TROY_OUNCE_GRAMS) * usdEgp * premium[metal]
+        : 0;
+  }
 
   const byKarat = {};
-  for (const k of KARATS) {
-    const override = settings.karatOverrides?.[k];
+  for (const p of PURITIES) {
+    const livePrice =
+      pureGram[p.metal] > 0 ? pureGram[p.metal] * p.fraction : 0;
+    const override = settings.karatOverrides?.[p.key];
     if (override !== "" && override !== undefined && toNumber(override) > 0) {
-      byKarat[k] = { price: toNumber(override), source: "manual" };
-    } else {
-      byKarat[k] = {
-        price: gram24 > 0 ? (gram24 * Number(k)) / 24 : 0,
-        source: "live",
+      byKarat[p.key] = {
+        price: toNumber(override),
+        livePrice,
+        source: "manual",
       };
+    } else {
+      byKarat[p.key] = { price: livePrice, livePrice, source: "live" };
     }
   }
-  return { gram24, byKarat, usdEgp, usdPerOunce };
+  return {
+    gram24: pureGram.gold,
+    gramSilver: pureGram.silver,
+    byKarat,
+    usdEgp,
+    usdPerOunce: spot.gold,
+    silverUsdPerOunce: spot.silver,
+  };
 }
 
 export function roundPrice(price, rounding) {
@@ -155,6 +228,54 @@ export function karatFromText(text) {
   if (!text) return null;
   const m = String(text).match(KARAT_RE) || String(text).match(KARAT_PREFIX_RE);
   return m && KARATS.includes(m[1]) ? m[1] : null;
+}
+
+// Silver: a product is silver when its metal metafield, title, tags, type or SKU says
+// so ("silver", "sterling", "فضة") or carries a silver-only hallmark such as 925.
+// 999 alone is NOT treated as silver, because fine gold is also stamped 999.
+const SILVER_WORDS = ["silver", "sterling", "فضة", "فضه", "فضي"];
+const GOLD_WORDS = ["gold", "ذهب"];
+
+function codeRegex(code) {
+  return new RegExp(`(?<!\\d)${code}(?![\\d])`);
+}
+
+/** "925", "S925", "925 silver", "sterling" -> "S925". null if not a known silver purity. */
+export function silverPurityFromText(text) {
+  if (!text) return null;
+  const t = String(text).toLowerCase();
+  for (const p of PURITIES) {
+    if (p.metal !== "silver") continue;
+    if ((p.codes || []).some((c) => codeRegex(c).test(t))) return p.key;
+  }
+  for (const p of PURITIES) {
+    if (p.metal !== "silver") continue;
+    if ((p.words || []).some((w) => t.includes(w))) return p.key;
+  }
+  return null;
+}
+
+/** Hallmarks that only silver uses (e.g. 925); 999 is shared with gold. */
+function hasSilverOnlyHallmark(text) {
+  if (!text) return false;
+  const t = String(text).toLowerCase();
+  const goldFine = ["999"];
+  return PURITIES.some(
+    (p) =>
+      p.metal === "silver" &&
+      (p.codes || []).some(
+        (c) => !goldFine.includes(c) && codeRegex(c).test(t),
+      ),
+  );
+}
+
+/** "silver" | "gold" | null, from one piece of text. */
+export function metalFromText(text) {
+  if (!text) return null;
+  const t = String(text).toLowerCase();
+  if (SILVER_WORDS.some((w) => t.includes(w))) return "silver";
+  if (GOLD_WORDS.some((w) => t.includes(w))) return "gold";
+  return null;
 }
 
 const LOCAL_WORDS = ["محلي", "مصري", "local", "egyptian", "egypt"];
@@ -245,7 +366,8 @@ export function toGrams(value, unit) {
   }
 }
 
-const KARAT_KEYS = ["karat", "carat", "purity", "عيار"];
+const KARAT_KEYS = ["karat", "carat", "purity", "fineness", "عيار"];
+const METAL_KEYS = ["metal", "material", "metal_type", "المعدن"];
 const ORIGIN_KEYS = ["origin", "المنشأ"];
 const WEIGHT_KEYS = [
   "metal_weight",
@@ -273,15 +395,42 @@ export function detectVariant(product, variant) {
   const metafields = product.metafields || [];
   const tags = product.tags || [];
 
+  const texts = [
+    product.title,
+    ...tags,
+    product.productType,
+    variant.title,
+    variant.sku,
+  ];
+  const metaMetal = metalFromText(findMeta(metafields, METAL_KEYS));
+  const metaPurity = findMeta(metafields, KARAT_KEYS);
+  const metal =
+    metaMetal ||
+    (silverPurityFromText(metaPurity) && !normalizeKarat(metaPurity)
+      ? "silver"
+      : null) ||
+    texts.map(metalFromText).find(Boolean) ||
+    (texts.some(hasSilverOnlyHallmark) ? "silver" : "gold");
+
   let karat = null;
   let karatSource = null;
-  const tries = [
-    ["metafield", normalizeKarat(findMeta(metafields, KARAT_KEYS))],
-    ["title", karatFromText(product.title)],
-    ["tags", tags.map(karatFromText).find(Boolean) || null],
-    ["product type", karatFromText(product.productType)],
-    ["SKU", karatFromText(variant.sku)],
-  ];
+  const tries =
+    metal === "silver"
+      ? [
+          ["metafield", silverPurityFromText(metaPurity)],
+          ["title", silverPurityFromText(product.title)],
+          ["tags", tags.map(silverPurityFromText).find(Boolean) || null],
+          ["product type", silverPurityFromText(product.productType)],
+          ["variant title", silverPurityFromText(variant.title)],
+          ["SKU", silverPurityFromText(variant.sku)],
+        ]
+      : [
+          ["metafield", normalizeKarat(metaPurity)],
+          ["title", karatFromText(product.title)],
+          ["tags", tags.map(karatFromText).find(Boolean) || null],
+          ["product type", karatFromText(product.productType)],
+          ["SKU", karatFromText(variant.sku)],
+        ];
   for (const [src, val] of tries) {
     if (val) {
       karat = val;
@@ -323,7 +472,15 @@ export function detectVariant(product, variant) {
       ? toNumber(makingRaw)
       : null;
 
-  return { karat, karatSource, origin, weight, weightSource, makingOverride };
+  return {
+    metal,
+    karat,
+    karatSource,
+    origin,
+    weight,
+    weightSource,
+    makingOverride,
+  };
 }
 
 /**
@@ -344,6 +501,7 @@ export function buildPlan(products, settings, prices) {
         variantTitle: variant.title,
         sku: variant.sku || "",
         currentPrice: toNumber(variant.price, 0),
+        metal: d.metal,
         karat: d.karat,
         origin: d.origin,
         weight: d.weight,
@@ -351,7 +509,13 @@ export function buildPlan(products, settings, prices) {
       };
 
       if (!d.karat) {
-        skipped.push({ ...base, reason: "Karat not found" });
+        skipped.push({
+          ...base,
+          reason:
+            d.metal === "silver"
+              ? "Silver purity not found"
+              : "Karat not found",
+        });
         continue;
       }
       if (!settings.includeKarats.includes(d.karat)) continue;
@@ -376,7 +540,7 @@ export function buildPlan(products, settings, prices) {
         skipped.push({
           ...base,
           origin,
-          reason: "No gold price for this karat",
+          reason: `No ${d.metal} price for ${purityLabel(d.karat)}`,
         });
         continue;
       }
