@@ -77,16 +77,20 @@ model PricePreview {
 
 // Daily market price history, shared by all stores (market data, not store data).
 // One row per metal per day (Cairo date), holding the last price seen that day.
+// Daily metal price history per store currency. The usdEgp and egpPerGram columns
+// keep their original names but hold the USD -> `currency` rate and the price per
+// gram in `currency` (EGP for rows from before multi-currency).
 model MetalRate {
   id          Int      @id @default(autoincrement())
   metal       String
   day         String
+  currency    String   @default("EGP")
   usdPerOunce Float
   usdEgp      Float
   egpPerGram  Float
   source      String
   updatedAt   DateTime @updatedAt
 
-  @@unique([metal, day])
+  @@unique([metal, day, currency])
   @@index([day])
 }

@@ -1,10 +1,11 @@
-// Live global gold and silver prices (XAU/USD, XAG/USD spot) and the USD -> EGP exchange rate.
+// Live global gold and silver prices (XAU/USD, XAG/USD spot) and the exchange rate
+// from USD to the store's own Shopify currency (EGP, AED, EUR, ...).
 //
 // Sources (all free, no API key):
 //   Gold spot:  https://api.gold-api.com/price/XAU            (live, updates every few seconds)
 //   Silver spot: https://api.gold-api.com/price/XAG           (live)
-//   USD/EGP:    https://open.er-api.com/v6/latest/USD         (updates daily)
-//   Fallback:   https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api  (daily XAU + EGP rates)
+//   USD rates:  https://open.er-api.com/v6/latest/USD         (all currencies, updates daily)
+//   Fallback:   https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api  (daily XAU + all currencies)
 //
 // Results are cached in memory so every dashboard poll does not hit the providers.
 
@@ -12,12 +13,16 @@ import db from "../db.server";
 
 const GOLD_TTL_MS = 30 * 1000;
 const FX_TTL_MS = 60 * 60 * 1000;
+// A rate older than this is "outdated": the dashboard warns and price updates are
+// blocked (unless the merchant enters a manual rate) instead of using it silently.
+// The providers publish once a day, so a healthy rate is at most ~24 hours old.
+export const FX_MAX_AGE_MS = 48 * 60 * 60 * 1000;
 const TIMEOUT_MS = 8000;
 
 const cache = {
   gold: null, // { usdPerOunce, source, updatedAt, fetchedAt }
   silver: null, // { usdPerOunce, source, updatedAt, fetchedAt }
-  fx: null, // { usdEgp, source, updatedAt, fetchedAt }
+  fx: null, // { rates: { EGP: 47.6, AED: 3.67, ... }, source, updatedAt, fetchedAt }
 };
 
 async function getJson(url) {
@@ -74,14 +79,14 @@ async function fetchSpot(symbol) {
 const fetchGold = () => fetchSpot("XAU");
 const fetchSilver = () => fetchSpot("XAG");
 
+// One request gives the USD rate for every currency, so all stores share it.
 async function fetchFx() {
   try {
     const data = await getJson("https://open.er-api.com/v6/latest/USD");
-    const rate = Number(data?.rates?.EGP);
-    if (data?.result !== "success" || !(rate > 0))
-      throw new Error("open.er-api.com returned no EGP rate");
+    if (data?.result !== "success" || !data.rates || !(data.rates.EGP > 0))
+      throw new Error("open.er-api.com returned no rates");
     return {
-      usdEgp: rate,
+      rates: data.rates,
       source: "open.er-api.com",
       updatedAt: data.time_last_update_unix
         ? new Date(data.time_last_update_unix * 1000).toISOString()
@@ -89,14 +94,26 @@ async function fetchFx() {
     };
   } catch (primaryError) {
     const { rates, date } = await fetchFallbackRates();
-    const egp = Number(rates?.egp);
-    if (!(egp > 0)) throw primaryError;
+    if (!rates || !(Number(rates.egp) > 0)) throw primaryError;
+    const upper = {};
+    for (const [code, value] of Object.entries(rates))
+      if (/^[a-z]{3}$/.test(code)) upper[code.toUpperCase()] = Number(value);
     return {
-      usdEgp: egp,
+      rates: upper,
       source: "currency-api (daily)",
       updatedAt: date ? new Date(date).toISOString() : new Date().toISOString(),
     };
   }
+}
+
+/** USD -> currency from the shared rates table: { rate, error }. */
+function rateFor(fx, currency) {
+  if (currency === "USD") return { rate: 1 };
+  const rate = Number(fx?.rates?.[currency]);
+  if (rate > 0) return { rate };
+  if (!fx?.rates)
+    return { rate: null, error: fx?.error || "rates unavailable" };
+  return { rate: null, error: `no exchange rate published for ${currency}` };
 }
 
 async function cached(key, ttl, fetcher) {
@@ -115,10 +132,13 @@ async function cached(key, ttl, fetcher) {
 }
 
 /**
- * Returns the latest live market data:
- * { usdPerOunce, usdEgp, egpPerGram24, gold: {...}, fx: {...}, ok, fetchedAt }
+ * Returns the latest live market data, priced in `currency` (the store's Shopify
+ * currency, e.g. "EGP"):
+ * { currency, usdPerOunce, silverUsdPerOunce, usdRate, perGram24, gold, silver, fx, ok, fetchedAt }
+ * usdRate = how many units of `currency` one US dollar buys (1 for USD).
+ * fx.outdated = the rate is older than FX_MAX_AGE_MS (or missing).
  */
-export async function getLiveGoldPrice() {
+export async function getLiveGoldPrice(currency = "EGP") {
   const [gold, silver, fx] = await Promise.all([
     cached("gold", GOLD_TTL_MS, fetchGold),
     cached("silver", GOLD_TTL_MS, fetchSilver),
@@ -126,14 +146,22 @@ export async function getLiveGoldPrice() {
   ]);
   const usdPerOunce = gold.usdPerOunce || null;
   const silverUsdPerOunce = silver.usdPerOunce || null;
-  const usdEgp = fx.usdEgp || null;
+  const { rate, error: rateError } = rateFor(fx, currency);
+  const usdRate = rate || null;
+  const fxUpdatedAt = currency === "USD" ? null : fx.updatedAt || null;
+  const outdated =
+    currency !== "USD" &&
+    (!usdRate ||
+      !fxUpdatedAt ||
+      Date.now() - new Date(fxUpdatedAt).getTime() > FX_MAX_AGE_MS);
   const live = {
-    ok: Boolean(usdPerOunce && usdEgp),
+    ok: Boolean(usdPerOunce && usdRate),
+    currency,
     usdPerOunce,
     silverUsdPerOunce,
-    usdEgp,
-    egpPerGram24:
-      usdPerOunce && usdEgp ? (usdPerOunce / 31.1034768) * usdEgp : null,
+    usdRate,
+    perGram24:
+      usdPerOunce && usdRate ? (usdPerOunce / 31.1034768) * usdRate : null,
     gold: {
       source: gold.source || null,
       updatedAt: gold.updatedAt || null,
@@ -147,10 +175,11 @@ export async function getLiveGoldPrice() {
       error: silver.error || null,
     },
     fx: {
-      source: fx.source || null,
-      updatedAt: fx.updatedAt || null,
-      stale: fx.stale,
-      error: fx.error || null,
+      source: currency === "USD" ? "none needed" : fx.source || null,
+      updatedAt: fxUpdatedAt,
+      stale: currency === "USD" ? false : fx.stale,
+      outdated,
+      error: currency === "USD" ? null : rateError || fx.error || null,
     },
     fetchedAt: new Date().toISOString(),
   };
@@ -165,7 +194,7 @@ export async function getLiveGoldPrice() {
 // ---------------------------------------------------------------------------
 
 const HISTORY_EVERY_MS = 10 * 60 * 1000;
-let lastHistoryWrite = 0;
+const lastHistoryWrite = new Map(); // currency -> time of last write
 
 export function cairoDay(date = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
@@ -178,8 +207,11 @@ export function cairoDay(date = new Date()) {
 
 function recordDailyRates(live) {
   const now = Date.now();
-  if (now - lastHistoryWrite < HISTORY_EVERY_MS || !live.usdEgp) return;
-  lastHistoryWrite = now;
+  const { currency } = live;
+  // Never record an outdated or missing rate as today's price.
+  if (!live.usdRate || live.fx.outdated) return;
+  if (now - (lastHistoryWrite.get(currency) || 0) < HISTORY_EVERY_MS) return;
+  lastHistoryWrite.set(currency, now);
   const day = cairoDay();
   const rows = [
     ["gold", live.usdPerOunce, live.gold.source],
@@ -189,13 +221,13 @@ function recordDailyRates(live) {
     rows.map(([metal, usdPerOunce, source]) => {
       const data = {
         usdPerOunce,
-        usdEgp: live.usdEgp,
-        egpPerGram: (usdPerOunce / 31.1034768) * live.usdEgp,
+        usdEgp: live.usdRate,
+        egpPerGram: (usdPerOunce / 31.1034768) * live.usdRate,
         source: source || "unknown",
       };
       return db.metalRate.upsert({
-        where: { metal_day: { metal, day } },
-        create: { metal, day, ...data },
+        where: { metal_day_currency: { metal, day, currency } },
+        create: { metal, day, currency, ...data },
         update: data,
       });
     }),
@@ -204,10 +236,11 @@ function recordDailyRates(live) {
   });
 }
 
-/** Last `days` days of history, newest first: [{ day, gold, silver }] (EGP per gram, pure metal, no premium). */
-export async function recentRates(days = 14) {
+/** Last `days` days of history, newest first: [{ day, gold, silver }] (price per gram in `currency`, pure metal, no premium). */
+export async function recentRates(days = 14, currency = "EGP") {
   try {
     const rows = await db.metalRate.findMany({
+      where: { currency },
       orderBy: { day: "desc" },
       take: days * 2,
     });

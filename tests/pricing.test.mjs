@@ -66,11 +66,11 @@ test("origin detection", () => {
 
 test("karat prices from spot", () => {
   const s = normalizeSettings({});
-  const p = karatPrices({ usdPerOunce: 3110.34768, usdEgp: 50 }, s);
+  const p = karatPrices({ usdPerOunce: 3110.34768, usdRate: 50 }, s);
   assert.ok(Math.abs(p.gram24 - 5000) < 0.001);
   assert.ok(Math.abs(p.byKarat["21"].price - 4375) < 0.001);
   const withPremium = karatPrices(
-    { usdPerOunce: 3110.34768, usdEgp: 50 },
+    { usdPerOunce: 3110.34768, usdRate: 50 },
     normalizeSettings({ premiumPct: 2 }),
   );
   assert.ok(Math.abs(withPremium.gram24 - 5100) < 0.001);
@@ -127,7 +127,7 @@ test("buildPlan prices, skips and flags", () => {
     rounding: "1",
     warnChangePct: 20,
   });
-  const prices = karatPrices({ usdPerOunce: 3110.34768, usdEgp: 50 }, settings);
+  const prices = karatPrices({ usdPerOunce: 3110.34768, usdRate: 50 }, settings);
   const products = [
     {
       id: "gid://shopify/Product/1",
@@ -255,7 +255,7 @@ test("silver prices use the silver spot price and premium", () => {
   const s = normalizeSettings({ silverPremiumPct: 10 });
   // 31.1034768 USD/oz * 50 EGP = 50 EGP per gram of fine silver
   const p = karatPrices(
-    { usdPerOunce: 3110.34768, silverUsdPerOunce: 31.1034768, usdEgp: 50 },
+    { usdPerOunce: 3110.34768, silverUsdPerOunce: 31.1034768, usdRate: 50 },
     s,
   );
   assert.equal(Math.round(p.gramSilver * 100) / 100, 55);
@@ -264,7 +264,7 @@ test("silver prices use the silver spot price and premium", () => {
   // gold unaffected by the silver premium
   assert.equal(Math.round(p.byKarat["24"].price), 5000);
   // no silver spot -> no silver price, gold still works
-  const noSilver = karatPrices({ usdPerOunce: 3110.34768, usdEgp: 50 }, s);
+  const noSilver = karatPrices({ usdPerOunce: 3110.34768, usdRate: 50 }, s);
   assert.equal(noSilver.byKarat.S925.price, 0);
 });
 
@@ -279,4 +279,26 @@ test("old saved settings keep working and new purities start switched off", () =
   assert.equal(old.karatOverrides["9"], "");
   // every purity has a key, metal and fraction
   for (const p of PURITIES) assert.ok(p.key && p.metal && p.fraction > 0);
+});
+
+test("settings keep a valid store currency code and drop anything else", () => {
+  assert.equal(normalizeSettings({ currency: "AED" }).currency, "AED");
+  assert.equal(normalizeSettings({ currency: "aed" }).currency, "");
+  assert.equal(normalizeSettings({ currency: "<b>" }).currency, "");
+  assert.equal(normalizeSettings({}).currency, "");
+});
+
+test("prices follow the store currency rate (USD = 1, AED, manual rate wins)", () => {
+  const s = normalizeSettings({});
+  const usd = karatPrices({ usdPerOunce: 3110.34768, usdRate: 1 }, s);
+  assert.equal(Math.round(usd.byKarat["24"].price * 1000) / 1000, 100);
+  const aed = karatPrices({ usdPerOunce: 3110.34768, usdRate: 3.6725 }, s);
+  assert.equal(Math.round(aed.byKarat["24"].price * 1000) / 1000, 367.25);
+  const manual = karatPrices(
+    { usdPerOunce: 3110.34768, usdRate: 3.6725 },
+    normalizeSettings({ usdEgpOverride: "4" }),
+  );
+  assert.equal(Math.round(manual.byKarat["24"].price * 1000) / 1000, 400);
+  const noRate = karatPrices({ usdPerOunce: 3110.34768, usdRate: null }, s);
+  assert.equal(noRate.byKarat["24"].price, 0);
 });
