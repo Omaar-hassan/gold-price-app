@@ -23,7 +23,12 @@ export default function App() {
         <Link to="/app" rel="home">
           Dashboard
         </Link>
+        <Link to="/app/rates">Metal Rates</Link>
+        <Link to="/app/pricing">Pricing</Link>
         <Link to="/app/products">Products</Link>
+        <Link to="/app/updates">Price Updates</Link>
+        <Link to="/app/history">History</Link>
+        <Link to="/app/settings">Settings</Link>
       </NavMenu>
       <Outlet />
     </AppProvider>
