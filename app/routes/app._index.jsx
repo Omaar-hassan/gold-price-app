@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { json } from "@remix-run/node";
-import { useFetcher, useLoaderData } from "@remix-run/react";
+import { useLoaderData, useRouteError } from "@remix-run/react";
 import {
   Badge,
   Banner,
@@ -25,6 +25,7 @@ import {
   useIndexResourceState,
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
+import { FriendlyError } from "../components/FriendlyError";
 import { authenticate } from "../shopify.server";
 import { getLiveGoldPrice, recentRates } from "../lib/goldPrice.server";
 import {
@@ -60,6 +61,12 @@ import {
 } from "../lib/formula";
 
 export const meta = () => [{ title: "Gold Price Editor" }];
+
+// The page keeps its own state from each action's reply, so Remix doesn't need to
+// reload every loader after a save, preview, apply or undo. Fewer requests also means
+// fewer chances for a network blip to break the page.
+export const shouldRevalidate = ({ formMethod, defaultShouldRevalidate }) =>
+  formMethod ? false : defaultShouldRevalidate;
 
 // ---------------------------------------------------------------------------
 // Server
@@ -938,8 +945,8 @@ function SkippedTable({ skipped }) {
 
 export default function Dashboard() {
   const data = useLoaderData();
-  const liveFetcher = useFetcher();
-  const actionFetcher = useFetcher();
+  const [refreshing, setRefreshing] = useState(false);
+  const [busyIntent, setBusyIntent] = useState(null);
 
   const [live, setLive] = useState(data.live);
   const [settings, setSettings] = useState(() =>
@@ -954,28 +961,39 @@ export default function Dashboard() {
   const [helpOpen, setHelpOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const firstSpot = useRef(data.live.usdPerOunce);
-  const lastIntent = useRef(null);
+  const busyRef = useRef(false);
+
+  // Refresh the live price. A failed refresh (server waking up or restarting, Wi-Fi
+  // drop) is ignored: the last price stays on screen and its "updated x ago" shows
+  // it is getting old. Plain fetch, not a Remix fetcher, because a fetcher sends a
+  // network error to the error screen and replaces the whole page.
+  const refreshLive = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const res = await fetch("/app/gold-price", { cache: "no-store" });
+      if (res.ok) {
+        const next = await res.json();
+        if (next && next.fetchedAt) setLive(next);
+      }
+    } catch (error) {
+      console.warn("Live price refresh failed, will retry:", error);
+    } finally {
+      setRefreshing(false);
+    }
+  }, []);
 
   // Poll the live price every 30 seconds and tick the "updated x ago" clock.
-  const liveLoad = liveFetcher.load;
   useEffect(() => {
-    const poll = setInterval(() => liveLoad("/app/gold-price"), 30000);
+    const poll = setInterval(refreshLive, 30000);
     const tick = setInterval(() => setNow(Date.now()), 5000);
     return () => {
       clearInterval(poll);
       clearInterval(tick);
     };
-  }, [liveLoad]);
-
-  useEffect(() => {
-    if (liveFetcher.data && liveFetcher.data.fetchedAt)
-      setLive(liveFetcher.data);
-  }, [liveFetcher.data]);
+  }, [refreshLive]);
 
   // Handle action results.
-  useEffect(() => {
-    const d = actionFetcher.data;
-    if (!d || actionFetcher.state !== "idle") return;
+  const handleResult = useCallback((d) => {
     if (d.error) {
       setNotice({ tone: "critical", title: d.error });
       return;
@@ -1014,11 +1032,10 @@ export default function Dashboard() {
       setPreview(null);
       setConfirming(false);
     }
-  }, [actionFetcher.data, actionFetcher.state]);
+  }, []);
 
   const prices = useMemo(() => karatPrices(live, settings), [live, settings]);
-  const busy = actionFetcher.state !== "idle";
-  const busyIntent = busy ? lastIntent.current : null;
+  const busy = busyIntent !== null;
   const trend =
     live.usdPerOunce &&
     firstSpot.current &&
@@ -1026,15 +1043,47 @@ export default function Dashboard() {
       ? live.usdPerOunce - firstSpot.current
       : 0;
 
+  // Send an action (save, preview, apply, undo) to this page's server action.
+  // Plain fetch so that a network error shows a message and keeps the page and its
+  // unsaved settings, instead of the full-page "Application Error".
   const submit = useCallback(
-    (payload) => {
-      lastIntent.current = payload.intent;
-      actionFetcher.submit(JSON.stringify(payload), {
-        method: "post",
-        encType: "application/json",
-      });
+    async (payload) => {
+      if (busyRef.current) return;
+      busyRef.current = true;
+      setBusyIntent(payload.intent);
+      try {
+        const res = await fetch("/app?index&_data=routes%2Fapp._index", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        let body = null;
+        try {
+          body = await res.json();
+        } catch {
+          body = null;
+        }
+        if (body && typeof body === "object" && (body.intent || body.error)) {
+          handleResult(body);
+        } else {
+          handleResult({
+            error: `The server could not finish this (error ${res.status}). Please try again.`,
+          });
+        }
+      } catch (error) {
+        console.warn("Action failed:", error);
+        handleResult({
+          error:
+            payload.intent === "apply" || payload.intent === "undo"
+              ? "Lost the connection to the app server. Some prices may or may not have changed: reload the page and check Recent updates before trying again."
+              : "Lost the connection to the app server. It may be waking up: please wait a few seconds and try again.",
+        });
+      } finally {
+        busyRef.current = false;
+        setBusyIntent(null);
+      }
     },
-    [actionFetcher],
+    [handleResult],
   );
 
   const set = (key, value) => setSettings((s) => ({ ...s, [key]: value }));
@@ -1076,7 +1125,8 @@ export default function Dashboard() {
       }}
     >
       <TitleBar title="Gold Price Editor" />
-      <style>{STYLES}</style>
+      {/* As raw HTML: React escapes ">" in style text on the server, which broke hydration. */}
+      <style dangerouslySetInnerHTML={{ __html: STYLES }} />
 
       <BlockStack gap="500">
         <LiveHero
@@ -1086,8 +1136,8 @@ export default function Dashboard() {
           usdEgp={prices.usdEgp}
           now={now}
           trend={trend}
-          onRefresh={() => liveLoad("/app/gold-price")}
-          refreshing={liveFetcher.state === "loading"}
+          onRefresh={refreshLive}
+          refreshing={refreshing}
         />
 
         {!live.ok && (
@@ -1621,4 +1671,9 @@ function Stat({ label, value, tone }) {
       </BlockStack>
     </Box>
   );
+}
+
+// Shown instead of Remix's bare "Application Error" if this page ever crashes.
+export function ErrorBoundary() {
+  return <FriendlyError error={useRouteError()} />;
 }
