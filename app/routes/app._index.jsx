@@ -31,6 +31,7 @@ import {
   applyPrices,
   claimPreview,
   fetchAllProducts,
+  fetchTaxesIncluded,
   fetchVariantPrices,
   getRun,
   loadSettings,
@@ -48,8 +49,15 @@ import {
   buildPlan,
   karatPrices,
   normalizeSettings,
+  priceWithFormula,
   toNumber,
 } from "../lib/pricing";
+import {
+  TEMPLATE_BY_ID,
+  VARIABLES,
+  parseFormula,
+  validateFormula,
+} from "../lib/formula";
 
 export const meta = () => [{ title: "Gold Price Editor" }];
 
@@ -59,13 +67,14 @@ export const meta = () => [{ title: "Gold Price Editor" }];
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
-  const [live, settings, runs, history] = await Promise.all([
+  const [live, settings, runs, history, taxesIncluded] = await Promise.all([
     getLiveGoldPrice(),
     loadSettings(admin, session.shop),
     recentRuns(session.shop),
     recentRates(14),
+    fetchTaxesIncluded(admin),
   ]);
-  return json({ live, settings, runs, history });
+  return json({ live, settings, runs, history, taxesIncluded });
 };
 
 export const action = async ({ request }) => {
@@ -94,9 +103,18 @@ export const action = async ({ request }) => {
           { status: 503 },
         );
       }
-      const products = await fetchAllProducts(admin);
+      const [products, taxesIncluded] = await Promise.all([
+        fetchAllProducts(admin),
+        fetchTaxesIncluded(admin),
+      ]);
       const images = Object.fromEntries(products.map((p) => [p.id, p.image]));
-      const plan = buildPlan(products, settings, prices);
+      const plan = buildPlan(products, settings, prices, { taxesIncluded });
+      if (plan.formulaError) {
+        return json(
+          { intent: "preview", error: plan.formulaError },
+          { status: 400 },
+        );
+      }
       const snapshot = {
         gram24: prices.gram24,
         usdPerOunce: prices.usdPerOunce,
@@ -115,6 +133,7 @@ export const action = async ({ request }) => {
           image: images[r.productId] || null,
         })),
         skipped: plan.skipped,
+        vatBlocked: plan.vatBlocked,
         snapshot,
       });
     }
@@ -250,7 +269,9 @@ function timeAgo(iso, now) {
 }
 
 function formatDate(iso) {
+  // Fixed time zone so the server and the browser show the same time.
   return new Date(iso).toLocaleString("en-GB", {
+    timeZone: "Africa/Cairo",
     day: "numeric",
     month: "short",
     hour: "2-digit",
@@ -265,7 +286,12 @@ function formatDate(iso) {
 const STYLES = `
   .gpe-hero { background: linear-gradient(135deg, #2b2100 0%, #5c4300 45%, #b8860b 100%); border-radius: 16px; padding: 24px; color: #fff; }
   .gpe-hero-label { opacity: .8; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; }
-  .gpe-hero-price { font-size: 40px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  .gpe-hero-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) repeat(3, minmax(0, 1fr)); gap: 24px; }
+  .gpe-hero-grid > * { min-width: 0; }
+  @media (max-width: 900px) { .gpe-hero-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 480px) { .gpe-hero-grid { grid-template-columns: minmax(0, 1fr); } }
+  .gpe-hero-price { font-size: clamp(28px, 3.4vw, 40px); font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .gpe-hero-price.small { font-size: clamp(22px, 2.2vw, 28px); }
   .gpe-hero-sub { opacity: .85; font-size: 14px; font-variant-numeric: tabular-nums; }
   .gpe-chip { display: inline-flex; align-items: center; gap: 6px; background: rgba(255,255,255,.15); border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 600; }
   .gpe-dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 0 0 rgba(74,222,128,.7); animation: gpe-pulse 2s infinite; }
@@ -317,7 +343,7 @@ function LiveHero({
           </Button>
         </InlineStack>
 
-        <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="400">
+        <div className="gpe-hero-grid">
           <BlockStack gap="100">
             <span className="gpe-hero-label">24k gold · per gram</span>
             <span className="gpe-hero-price">
@@ -334,7 +360,7 @@ function LiveHero({
           </BlockStack>
           <BlockStack gap="100">
             <span className="gpe-hero-label">Fine silver · per gram</span>
-            <span className="gpe-hero-price" style={{ fontSize: 28 }}>
+            <span className="gpe-hero-price small">
               {gramSilver > 0 ? egp.format(gramSilver) : "—"}
             </span>
             <span className="gpe-hero-sub">
@@ -347,7 +373,7 @@ function LiveHero({
           </BlockStack>
           <BlockStack gap="100">
             <span className="gpe-hero-label">Global spot (XAU/USD)</span>
-            <span className="gpe-hero-price" style={{ fontSize: 28 }}>
+            <span className="gpe-hero-price small">
               {live.usdPerOunce ? usd.format(live.usdPerOunce) : "—"}
             </span>
             <span className="gpe-hero-sub">
@@ -356,14 +382,14 @@ function LiveHero({
           </BlockStack>
           <BlockStack gap="100">
             <span className="gpe-hero-label">USD → EGP</span>
-            <span className="gpe-hero-price" style={{ fontSize: 28 }}>
+            <span className="gpe-hero-price small">
               {usdEgp ? num.format(usdEgp) : "—"}
             </span>
             <span className="gpe-hero-sub">
               {live.fx.source || "no source"}
             </span>
           </BlockStack>
-        </InlineGrid>
+        </div>
       </BlockStack>
     </div>
   );
@@ -438,6 +464,312 @@ function RateHistory({ history }) {
         </tbody>
       </table>
     </div>
+  );
+}
+
+const activeFormulaOf = (settings) =>
+  settings.formulas.find((f) => f.id === settings.activeFormulaId) ||
+  settings.formulas[0];
+
+function FormulaCard({ settings, setSettings, prices, taxesIncluded }) {
+  const [newName, setNewName] = useState("");
+  const formula =
+    settings.formulas.find((f) => f.id === settings.activeFormulaId) ||
+    settings.formulas[0];
+  const template = TEMPLATE_BY_ID[formula.templateId];
+  const check = validateFormula(formula.expression);
+  const vatLocked = taxesIncluded === false;
+
+  const update = (patch) => setSettings((s) => ({ ...s, ...patch }));
+  const setExpression = (expression) =>
+    update({
+      formulas: settings.formulas.map((f) =>
+        f.id === formula.id ? { ...f, expression } : f,
+      ),
+    });
+  const choose = (id) => {
+    const t = TEMPLATE_BY_ID[id];
+    setSettings((s) => ({
+      ...s,
+      activeFormulaId: id,
+      vat: t?.suggestVatBasis ? { ...s.vat, basis: t.suggestVatBasis } : s.vat,
+    }));
+  };
+  const saveAsNew = () => {
+    const id = `custom-${Date.now().toString(36)}`;
+    update({
+      formulas: [
+        ...settings.formulas,
+        {
+          id,
+          name: newName.trim() || "My formula",
+          expression: formula.expression,
+        },
+      ],
+      activeFormulaId: id,
+    });
+    setNewName("");
+  };
+  const remove = () =>
+    update({
+      formulas: settings.formulas.filter((f) => f.id !== formula.id),
+      activeFormulaId: "classic",
+    });
+  const setVat = (patch) => update({ vat: { ...settings.vat, ...patch } });
+
+  // Live example: 21k (or the first priced purity), 5 g, local workmanship.
+  const exampleKey = prices.byKarat["21"]?.price > 0 ? "21" : "24";
+  const exampleVars = {
+    metal_price: prices.byKarat[exampleKey]?.price || 0,
+    weight: 5,
+    making: settings.making[exampleKey]?.local || 0,
+    making_pct: settings.makingPct,
+    wastage_pct: settings.wastagePct,
+    stone_cost: 0,
+    fixed_fee: settings.fixedFee,
+    profit_pct: settings.profitPct,
+    discount: settings.discountPerPiece,
+  };
+  let example = null;
+  let exampleError = null;
+  if (check.ok && exampleVars.metal_price > 0) {
+    try {
+      example = priceWithFormula(
+        parseFormula(formula.expression),
+        exampleVars,
+        settings,
+        !vatLocked,
+      );
+    } catch (error) {
+      exampleError = error.message;
+    }
+  }
+
+  return (
+    <Card>
+      <BlockStack gap="400">
+        <BlockStack gap="100">
+          <Text as="h2" variant="headingMd">
+            Price formula
+          </Text>
+          <Text as="p" tone="subdued">
+            Pick a ready-made formula or write your own with the building blocks
+            below. Switching formulas keeps all your values.
+          </Text>
+        </BlockStack>
+
+        <Select
+          label="Formula"
+          options={settings.formulas.map((f) => ({
+            label: f.templateId ? f.name : `${f.name} (yours)`,
+            value: f.id,
+          }))}
+          value={formula.id}
+          onChange={choose}
+        />
+        {template && (
+          <Text as="p" variant="bodySm" tone="subdued">
+            {template.description}
+          </Text>
+        )}
+
+        <TextField
+          label="Formula (before VAT, then rounded)"
+          value={formula.expression}
+          onChange={setExpression}
+          multiline={2}
+          monospaced
+          autoComplete="off"
+          error={check.ok ? undefined : check.error}
+        />
+        <InlineStack gap="200" wrap>
+          {VARIABLES.map((v) => (
+            <Button
+              key={v.name}
+              size="slim"
+              onClick={() =>
+                setExpression(`${formula.expression.trimEnd()} ${v.name}`)
+              }
+              accessibilityLabel={`Insert ${v.label}`}
+            >
+              {v.name}
+            </Button>
+          ))}
+        </InlineStack>
+
+        <div className="gpe-scroll">
+          <table className="gpe-matrix" style={{ minWidth: 0 }}>
+            <thead>
+              <tr>
+                <th>Building block</th>
+                <th>Means</th>
+                <th>Unit</th>
+              </tr>
+            </thead>
+            <tbody>
+              {VARIABLES.map((v) => (
+                <tr key={v.name}>
+                  <td>
+                    <code>{v.name}</code>
+                  </td>
+                  <td>{v.label}</td>
+                  <td>{v.unit}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <InlineStack gap="200" blockAlign="end" wrap>
+          {template && formula.expression !== template.expression && (
+            <Button onClick={() => setExpression(template.expression)}>
+              Reset to original
+            </Button>
+          )}
+          {!template && (
+            <Button tone="critical" variant="plain" onClick={remove}>
+              Delete this formula
+            </Button>
+          )}
+          <div style={{ minWidth: 200 }}>
+            <TextField
+              label="Save a copy as"
+              labelHidden
+              placeholder="Name for a new formula"
+              value={newName}
+              onChange={setNewName}
+              autoComplete="off"
+              connectedRight={
+                <Button onClick={saveAsNew} disabled={!check.ok}>
+                  Save as new
+                </Button>
+              }
+            />
+          </div>
+        </InlineStack>
+
+        <Box background="bg-surface-secondary" padding="300" borderRadius="200">
+          {exampleError ? (
+            <Text as="p" tone="critical">
+              Example failed: {exampleError}
+            </Text>
+          ) : example ? (
+            <Text as="p" variant="bodySm">
+              Example: {purityLabel(exampleKey)}, 5 g, local making charge →
+              before VAT {egp.format(example.preVat)}
+              {example.vat > 0
+                ? ` + VAT ${egp.format(example.vat)}`
+                : ""} = <strong>{egp.format(example.price)}</strong>
+            </Text>
+          ) : (
+            <Text as="p" variant="bodySm" tone="subdued">
+              The example appears when the formula is valid and a price is
+              available.
+            </Text>
+          )}
+        </Box>
+
+        <Divider />
+        <Text as="h3" variant="headingSm">
+          Optional costs
+        </Text>
+        <Text as="p" variant="bodySm" tone="subdued">
+          Shop-wide values. A product metafield with the same name (
+          <code>wastage_pct</code>, <code>making_pct</code>,{" "}
+          <code>fixed_fee</code>, <code>profit_pct</code>) overrides them for
+          that product. Stone / diamond cost is set per product in a{" "}
+          <code>stone_cost</code> metafield (EGP, total per piece). Each cost is
+          only used if your formula includes it.
+        </Text>
+        <InlineGrid columns={{ xs: 1, sm: 2 }} gap="300">
+          <TextField
+            label="Wastage"
+            type="number"
+            suffix="% of metal"
+            value={String(settings.wastagePct)}
+            onChange={(v) => update({ wastagePct: v })}
+            autoComplete="off"
+          />
+          <TextField
+            label="Making charge %"
+            type="number"
+            suffix="% of metal value"
+            value={String(settings.makingPct)}
+            onChange={(v) => update({ makingPct: v })}
+            autoComplete="off"
+          />
+          <TextField
+            label="Fixed fee"
+            type="number"
+            prefix="EGP"
+            suffix="per piece"
+            value={String(settings.fixedFee)}
+            onChange={(v) => update({ fixedFee: v })}
+            autoComplete="off"
+          />
+          <TextField
+            label="Profit"
+            type="number"
+            suffix="%"
+            value={String(settings.profitPct)}
+            onChange={(v) => update({ profitPct: v })}
+            autoComplete="off"
+          />
+        </InlineGrid>
+
+        <Divider />
+        <Text as="h3" variant="headingSm">
+          VAT
+        </Text>
+        {vatLocked ? (
+          <Banner tone="info">
+            <p>
+              Your Shopify store adds tax at checkout (Settings → Taxes and
+              duties → &quot;Include sales tax in product price&quot; is off).
+              Adding VAT here too would charge it twice, so VAT is switched off
+              in the app. Turn that Shopify setting on if your prices should
+              include VAT.
+            </p>
+          </Banner>
+        ) : taxesIncluded === null ? (
+          <Banner tone="warning">
+            <p>
+              We couldn&apos;t read your Shopify tax setting. Only add VAT here
+              if your Shopify prices include tax.
+            </p>
+          </Banner>
+        ) : null}
+        <Checkbox
+          label="Add VAT to prices"
+          checked={settings.vat.enabled && !vatLocked}
+          disabled={vatLocked}
+          onChange={(on) => setVat({ enabled: on })}
+          helpText="Added after the formula, before rounding."
+        />
+        <InlineGrid columns={{ xs: 1, sm: 2 }} gap="300">
+          <TextField
+            label="VAT rate"
+            type="number"
+            suffix="%"
+            value={String(settings.vat.pct)}
+            onChange={(v) => setVat({ pct: v })}
+            disabled={vatLocked || !settings.vat.enabled}
+            autoComplete="off"
+          />
+          <Select
+            label="VAT is charged on"
+            options={[
+              { label: "The total price", value: "total" },
+              { label: "Workmanship only", value: "workmanship" },
+            ]}
+            value={settings.vat.basis}
+            onChange={(v) => setVat({ basis: v })}
+            disabled={vatLocked || !settings.vat.enabled}
+            helpText="Workmanship = making charge per gram × weight, plus any making charge %."
+          />
+        </InlineGrid>
+      </BlockStack>
+    </Card>
   );
 }
 
@@ -806,6 +1138,12 @@ export default function Dashboard() {
                       · {formatDate(preview.snapshot.at)} ·{" "}
                       {preview.productCount} products scanned
                     </Text>
+                    {preview.vatBlocked && (
+                      <Text as="p" variant="bodySm" tone="caution">
+                        VAT was not added: your Shopify store adds tax at
+                        checkout.
+                      </Text>
+                    )}
                   </BlockStack>
                   <InlineStack gap="200">
                     <Button onClick={() => setPreview(null)} disabled={busy}>
@@ -1036,6 +1374,13 @@ export default function Dashboard() {
                 </BlockStack>
               </Card>
 
+              <FormulaCard
+                settings={settings}
+                setSettings={setSettings}
+                prices={prices}
+                taxesIncluded={data.taxesIncluded}
+              />
+
               <Card>
                 <BlockStack gap="400">
                   <Text as="h2" variant="headingMd">
@@ -1117,10 +1462,19 @@ export default function Dashboard() {
                     padding="300"
                     borderRadius="200"
                   >
-                    <Text as="p" variant="bodySm">
-                      (karat price per gram + workmanship per gram) × weight −
-                      discount, then rounded.
-                    </Text>
+                    <BlockStack gap="100">
+                      <Text as="p" variant="bodySm" fontWeight="semibold">
+                        {activeFormulaOf(settings).name}
+                      </Text>
+                      <Text as="p" variant="bodySm">
+                        <code>{activeFormulaOf(settings).expression}</code>
+                      </Text>
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        {settings.vat.enabled && data.taxesIncluded !== false
+                          ? `+ VAT ${settings.vat.pct}% on ${settings.vat.basis === "workmanship" ? "workmanship" : "the total"}, then rounded.`
+                          : "Then rounded. No VAT."}
+                      </Text>
+                    </BlockStack>
                   </Box>
                   <Text as="p" variant="bodySm" tone="subdued">
                     Karat price = 24k price × karat ÷ 24. 24k price = spot

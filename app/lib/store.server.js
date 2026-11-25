@@ -312,6 +312,29 @@ function parseSettings(text) {
   }
 }
 
+/**
+ * Shopify's "Include tax in product prices" setting.
+ * true  = prices include tax, so the app may add VAT to the price.
+ * false = Shopify adds tax at checkout, so the app must not add VAT (double VAT).
+ * null  = could not be read.
+ */
+export async function fetchTaxesIncluded(admin) {
+  try {
+    const data = await gql(
+      admin,
+      `#graphql
+      query ShopTax { shop { taxesIncluded } }
+    `,
+    );
+    return typeof data?.shop?.taxesIncluded === "boolean"
+      ? data.shop.taxesIncluded
+      : null;
+  } catch (error) {
+    console.error("[gold-price] could not read tax setting:", error.message);
+    return null;
+  }
+}
+
 export async function loadSettings(admin, shop) {
   try {
     const data = await gql(admin, SETTINGS_QUERY);

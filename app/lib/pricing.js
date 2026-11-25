@@ -1,3 +1,12 @@
+import {
+  TEMPLATES,
+  TEMPLATE_BY_ID,
+  MAX_EXPRESSION_LENGTH,
+  evaluateFormula,
+  parseFormula,
+  vatAmount,
+} from "./formula.js";
+
 // Pure pricing helpers. Shared by the server (plan + apply) and the dashboard (live karat table).
 // Keep this file free of server-only imports so it can run in the browser and in unit tests.
 
@@ -84,7 +93,55 @@ export const DEFAULT_SETTINGS = {
   unknownOrigin: "skip",
   // Changes larger than this % are flagged in the preview.
   warnChangePct: 20,
+  // Price formulas: the 5 templates (editable) + the store's own. See app/lib/formula.js.
+  formulas: TEMPLATES.map((t) => ({
+    id: t.id,
+    name: t.name,
+    expression: t.expression,
+    templateId: t.id,
+  })),
+  activeFormulaId: "classic",
+  // Optional costs (shop-wide defaults; a product metafield can override them).
+  wastagePct: 0, // % of the metal
+  makingPct: 0, // % of the metal value
+  fixedFee: 0, // EGP per piece
+  profitPct: 0, // %
+  // VAT is added after the formula. basis: "total" (whole price) or "workmanship".
+  vat: { enabled: false, pct: 14, basis: "total" },
 };
+
+export const MAX_CUSTOM_FORMULAS = 20;
+
+function normalizeFormulas(input) {
+  const saved = Array.isArray(input) ? input : [];
+  const byId = new Map(
+    saved.filter((f) => f && typeof f.id === "string").map((f) => [f.id, f]),
+  );
+  const clip = (text, max) => String(text ?? "").slice(0, max);
+  // Built-in templates always exist; a store's edit replaces the expression only.
+  const builtIn = TEMPLATES.map((t) => {
+    const mine = byId.get(t.id);
+    const expression = mine?.expression
+      ? clip(mine.expression, MAX_EXPRESSION_LENGTH)
+      : t.expression;
+    return { id: t.id, name: t.name, expression, templateId: t.id };
+  });
+  const custom = saved
+    .filter(
+      (f) =>
+        f &&
+        typeof f.id === "string" &&
+        f.id.startsWith("custom-") &&
+        !TEMPLATE_BY_ID[f.id],
+    )
+    .slice(0, MAX_CUSTOM_FORMULAS)
+    .map((f) => ({
+      id: clip(f.id, 40),
+      name: clip(f.name, 60).trim() || "My formula",
+      expression: clip(f.expression, MAX_EXPRESSION_LENGTH),
+    }));
+  return [...builtIn, ...custom];
+}
 
 export function toNumber(value, fallback = 0) {
   if (value === null || value === undefined || value === "") return fallback;
@@ -134,6 +191,22 @@ export function normalizeSettings(input = {}) {
       ? s.unknownOrigin
       : "skip",
     warnChangePct: Math.max(0, toNumber(s.warnChangePct, 20)),
+    ...(() => {
+      const formulas = normalizeFormulas(input.formulas);
+      const active = formulas.some((f) => f.id === input.activeFormulaId)
+        ? input.activeFormulaId
+        : "classic";
+      return { formulas, activeFormulaId: active };
+    })(),
+    wastagePct: Math.max(0, toNumber(s.wastagePct, 0)),
+    makingPct: Math.max(0, toNumber(s.makingPct, 0)),
+    fixedFee: Math.max(0, toNumber(s.fixedFee, 0)),
+    profitPct: toNumber(s.profitPct, 0),
+    vat: {
+      enabled: Boolean(input.vat?.enabled),
+      pct: Math.max(0, Math.min(100, toNumber(input.vat?.pct, 14))),
+      basis: input.vat?.basis === "workmanship" ? "workmanship" : "total",
+    },
   };
 }
 
@@ -378,6 +451,20 @@ const WEIGHT_KEYS = [
   "weight_g",
 ];
 const MAKING_KEYS = ["making_charge", "makingcharge", "workmanship", "مصنعية"];
+// Optional per-product costs (metafield keys, any namespace).
+const EXTRA_KEYS = {
+  wastage_pct: ["wastage_pct", "wastage", "هالك"],
+  making_pct: ["making_pct", "making_percent"],
+  stone_cost: [
+    "stone_cost",
+    "stones_cost",
+    "diamond_cost",
+    "gem_cost",
+    "stones",
+  ],
+  fixed_fee: ["fixed_fee", "fee"],
+  profit_pct: ["profit_pct", "profit_margin", "margin"],
+};
 
 function findMeta(metafields, keys) {
   const hit = (metafields || []).find((m) =>
@@ -472,6 +559,15 @@ export function detectVariant(product, variant) {
       ? toNumber(makingRaw)
       : null;
 
+  // null = not set on the product (use the shop default).
+  const extras = {};
+  for (const [name, keys] of Object.entries(EXTRA_KEYS)) {
+    const raw = findMeta(metafields, keys);
+    const n =
+      raw === null ? NaN : toNumber(String(raw).replace(/[^\d.,-]/g, ""), NaN);
+    extras[name] = Number.isFinite(n) ? n : null;
+  }
+
   return {
     metal,
     karat,
@@ -480,16 +576,51 @@ export function detectVariant(product, variant) {
     weight,
     weightSource,
     makingOverride,
+    extras,
   };
+}
+
+/** The store's active formula object. */
+export function activeFormula(settings) {
+  return (
+    settings.formulas.find((f) => f.id === settings.activeFormulaId) ||
+    settings.formulas[0]
+  );
+}
+
+/**
+ * Price of one piece with the store's formula, then VAT, then rounding.
+ * vars: the building blocks (see formula.js). vatAllowed=false switches VAT off.
+ */
+export function priceWithFormula(parsed, vars, settings, vatAllowed = true) {
+  const preVat = evaluateFormula(parsed, vars);
+  const vat = vatAllowed ? vatAmount(preVat, vars, settings.vat) : 0;
+  const raw = preVat + vat;
+  return { preVat, vat, raw, price: roundPrice(raw, settings.rounding) };
 }
 
 /**
  * Build the price plan for a list of products.
- * Returns { rows, skipped } where each row is one variant whose price would be set.
+ * options.taxesIncluded: Shopify's "prices include tax" setting. When it is false Shopify
+ * adds tax at checkout, so VAT is NOT added here (it would be charged twice).
+ * Returns { rows, skipped, formulaError, vatBlocked } where each row is one variant.
  */
-export function buildPlan(products, settings, prices) {
+export function buildPlan(products, settings, prices, options = {}) {
   const rows = [];
   const skipped = [];
+  const formula = activeFormula(settings);
+  let parsed;
+  try {
+    parsed = parseFormula(formula.expression);
+  } catch (error) {
+    return {
+      rows,
+      skipped,
+      formulaError: `The formula "${formula.name}" is invalid: ${error.message}`,
+    };
+  }
+  const vatBlocked =
+    Boolean(settings.vat?.enabled) && options.taxesIncluded === false;
 
   for (const product of products) {
     for (const variant of product.variants) {
@@ -547,13 +678,29 @@ export function buildPlan(products, settings, prices) {
 
       const makingPerGram =
         d.makingOverride ?? settings.making[d.karat]?.[origin] ?? 0;
-      const { price } = computePiecePrice({
-        gramPrice: gram,
+      const vars = {
+        metal_price: gram,
         weight: d.weight,
-        makingPerGram,
+        making: makingPerGram,
+        making_pct: d.extras?.making_pct ?? settings.makingPct,
+        wastage_pct: d.extras?.wastage_pct ?? settings.wastagePct,
+        stone_cost: d.extras?.stone_cost ?? 0,
+        fixed_fee: d.extras?.fixed_fee ?? settings.fixedFee,
+        profit_pct: d.extras?.profit_pct ?? settings.profitPct,
         discount: settings.discountPerPiece,
-        rounding: settings.rounding,
-      });
+      };
+      let calc;
+      try {
+        calc = priceWithFormula(parsed, vars, settings, !vatBlocked);
+      } catch (error) {
+        skipped.push({
+          ...base,
+          origin,
+          reason: `Formula error: ${error.message}`,
+        });
+        continue;
+      }
+      const { price } = calc;
 
       if (!(price > 0)) {
         skipped.push({
@@ -576,6 +723,9 @@ export function buildPlan(products, settings, prices) {
         gramPrice: gram,
         makingPerGram,
         makingFromProduct: d.makingOverride !== null,
+        stoneCost: vars.stone_cost,
+        preVat: Math.round(calc.preVat * 100) / 100,
+        vat: Math.round(calc.vat * 100) / 100,
         newPrice: Math.round(price * 100) / 100,
         changePct,
         unchanged,
@@ -585,7 +735,13 @@ export function buildPlan(products, settings, prices) {
     }
   }
 
-  return { rows, skipped };
+  return {
+    rows,
+    skipped,
+    formulaError: null,
+    vatBlocked,
+    formulaId: formula.id,
+  };
 }
 
 /**
