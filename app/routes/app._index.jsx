@@ -265,7 +265,12 @@ function formatDate(iso) {
 const STYLES = `
   .gpe-hero { background: linear-gradient(135deg, #2b2100 0%, #5c4300 45%, #b8860b 100%); border-radius: 16px; padding: 24px; color: #fff; }
   .gpe-hero-label { opacity: .8; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; }
-  .gpe-hero-price { font-size: 40px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  .gpe-hero-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) repeat(3, minmax(0, 1fr)); gap: 24px; }
+  .gpe-hero-grid > * { min-width: 0; }
+  @media (max-width: 900px) { .gpe-hero-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 480px) { .gpe-hero-grid { grid-template-columns: minmax(0, 1fr); } }
+  .gpe-hero-price { font-size: clamp(28px, 3.4vw, 40px); font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .gpe-hero-price.small { font-size: clamp(22px, 2.2vw, 28px); }
   .gpe-hero-sub { opacity: .85; font-size: 14px; font-variant-numeric: tabular-nums; }
   .gpe-chip { display: inline-flex; align-items: center; gap: 6px; background: rgba(255,255,255,.15); border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 600; }
   .gpe-dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 0 0 rgba(74,222,128,.7); animation: gpe-pulse 2s infinite; }
@@ -317,7 +322,7 @@ function LiveHero({
           </Button>
         </InlineStack>
 
-        <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="400">
+        <div className="gpe-hero-grid">
           <BlockStack gap="100">
             <span className="gpe-hero-label">24k gold · per gram</span>
             <span className="gpe-hero-price">
@@ -334,7 +339,7 @@ function LiveHero({
           </BlockStack>
           <BlockStack gap="100">
             <span className="gpe-hero-label">Fine silver · per gram</span>
-            <span className="gpe-hero-price" style={{ fontSize: 28 }}>
+            <span className="gpe-hero-price small">
               {gramSilver > 0 ? egp.format(gramSilver) : "—"}
             </span>
             <span className="gpe-hero-sub">
@@ -347,7 +352,7 @@ function LiveHero({
           </BlockStack>
           <BlockStack gap="100">
             <span className="gpe-hero-label">Global spot (XAU/USD)</span>
-            <span className="gpe-hero-price" style={{ fontSize: 28 }}>
+            <span className="gpe-hero-price small">
               {live.usdPerOunce ? usd.format(live.usdPerOunce) : "—"}
             </span>
             <span className="gpe-hero-sub">
@@ -356,14 +361,14 @@ function LiveHero({
           </BlockStack>
           <BlockStack gap="100">
             <span className="gpe-hero-label">USD → EGP</span>
-            <span className="gpe-hero-price" style={{ fontSize: 28 }}>
+            <span className="gpe-hero-price small">
               {usdEgp ? num.format(usdEgp) : "—"}
             </span>
             <span className="gpe-hero-sub">
               {live.fx.source || "no source"}
             </span>
           </BlockStack>
-        </InlineGrid>
+        </div>
       </BlockStack>
     </div>
   );
