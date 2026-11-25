@@ -473,17 +473,33 @@ const EXTRA_KEYS = {
   profit_pct: ["profit_pct", "profit_margin", "margin"],
 };
 
-function findMeta(metafields, keys) {
-  const hit = (metafields || []).find((m) =>
+// Values the merchant set with the app's Fix form live in this namespace. They win
+// over the same key in any other namespace.
+export const FIX_NAMESPACE = "gold_price";
+
+function findMetaHit(metafields, keys) {
+  const matches = (metafields || []).filter((m) =>
     keys.includes(String(m.key).toLowerCase()),
   );
-  return hit ? hit.value : null;
+  return (
+    matches.find((m) => m.namespace === FIX_NAMESPACE) || matches[0] || null
+  );
 }
+
+function findMeta(metafields, keys) {
+  return findMetaHit(metafields, keys)?.value ?? null;
+}
+
+// Where a metafield value came from, for the Products screen.
+const metaSource = (metafields, keys) =>
+  findMetaHit(metafields, keys)?.namespace === FIX_NAMESPACE
+    ? "your fix"
+    : "metafield";
 
 /**
  * Work out karat, origin, weight and making-charge override for one variant.
  * product: { title, productType, tags[], metafields[{key,value}] }
- * variant: { title, sku, weightGrams }
+ * variant: { title, sku, weightGrams, fixWeight? }
  */
 export function detectVariant(product, variant) {
   const metafields = product.metafields || [];
@@ -511,7 +527,10 @@ export function detectVariant(product, variant) {
   const tries =
     metal === "silver"
       ? [
-          ["metafield", silverPurityFromText(metaPurity)],
+          [
+            metaSource(metafields, KARAT_KEYS),
+            silverPurityFromText(metaPurity),
+          ],
           ["title", silverPurityFromText(product.title)],
           ["tags", tags.map(silverPurityFromText).find(Boolean) || null],
           ["product type", silverPurityFromText(product.productType)],
@@ -519,7 +538,7 @@ export function detectVariant(product, variant) {
           ["SKU", silverPurityFromText(variant.sku)],
         ]
       : [
-          ["metafield", normalizeKarat(metaPurity)],
+          [metaSource(metafields, KARAT_KEYS), normalizeKarat(metaPurity)],
           ["title", karatFromText(product.title)],
           ["tags", tags.map(karatFromText).find(Boolean) || null],
           ["product type", karatFromText(product.productType)],
@@ -534,17 +553,28 @@ export function detectVariant(product, variant) {
   }
 
   let origin = null;
+  let originSource = null;
   const originTries = [
-    originFromText(findMeta(metafields, ORIGIN_KEYS)),
-    originFromText(product.title),
-    tags.map(originFromText).find(Boolean) || null,
-    originFromText(product.productType),
+    [
+      metaSource(metafields, ORIGIN_KEYS),
+      originFromText(findMeta(metafields, ORIGIN_KEYS)),
+    ],
+    ["title", originFromText(product.title)],
+    ["tags", tags.map(originFromText).find(Boolean) || null],
+    ["product type", originFromText(product.productType)],
   ];
-  origin = originTries.find(Boolean) || null;
+  for (const [src, val] of originTries) {
+    if (val) {
+      origin = val;
+      originSource = src;
+      break;
+    }
+  }
 
   let weight = null;
   let weightSource = null;
   const weightTries = [
+    ["your fix", weightFromMetafield(variant.fixWeight)],
     ["metafield", weightFromMetafield(findMeta(metafields, WEIGHT_KEYS))],
     ["variant title", weightWithUnit(variant.title)],
     ["SKU", weightFromSku(variant.sku)],
@@ -580,6 +610,7 @@ export function detectVariant(product, variant) {
     karat,
     karatSource,
     origin,
+    originSource,
     weight,
     weightSource,
     makingOverride,
@@ -641,7 +672,9 @@ export function buildPlan(products, settings, prices, options = {}) {
         currentPrice: toNumber(variant.price, 0),
         metal: d.metal,
         karat: d.karat,
+        karatSource: d.karatSource,
         origin: d.origin,
+        originSource: d.originSource,
         weight: d.weight,
         weightSource: d.weightSource,
       };
@@ -774,4 +807,59 @@ export function splitByCurrentPrice(changes, currentPrices, expectedKey) {
     }
   }
   return { safe, skipped };
+}
+
+/**
+ * Every variant in the store with its status, for the Products screen:
+ * status "ready" (would be priced), "skipped" (with reason) or "excluded" (its purity
+ * is switched off in settings). Read-only: it never changes anything.
+ * Returns { items, counts: { all, ready, skipped, excluded }, formulaError }.
+ */
+export function productOverview(products, settings, prices, options = {}) {
+  const plan = buildPlan(products, settings, prices, options);
+  const ready = new Map(plan.rows.map((r) => [r.variantId, r]));
+  const skipped = new Map(plan.skipped.map((r) => [r.variantId, r]));
+  const items = [];
+  for (const product of products) {
+    for (const variant of product.variants) {
+      const base = {
+        productId: product.id,
+        productTitle: product.title,
+        productStatus: product.status || null,
+        image: product.image || null,
+        variantId: variant.id,
+        variantTitle: variant.title,
+        sku: variant.sku || "",
+        currentPrice: toNumber(variant.price, 0),
+      };
+      const r = ready.get(variant.id);
+      const k = skipped.get(variant.id);
+      if (r) {
+        items.push({ ...base, ...r, status: "ready", reason: null });
+      } else if (k) {
+        items.push({ ...base, ...k, status: "skipped", newPrice: null });
+      } else {
+        // Not priced and not skipped: the purity is not included in updates.
+        const d = detectVariant(product, variant);
+        items.push({
+          ...base,
+          metal: d.metal,
+          karat: d.karat,
+          karatSource: d.karatSource,
+          origin: d.origin,
+          originSource: d.originSource,
+          weight: d.weight,
+          weightSource: d.weightSource,
+          status: plan.formulaError ? "skipped" : "excluded",
+          reason: plan.formulaError
+            ? plan.formulaError
+            : `${purityLabel(d.karat)} is switched off in the dashboard`,
+          newPrice: null,
+        });
+      }
+    }
+  }
+  const counts = { all: items.length, ready: 0, skipped: 0, excluded: 0 };
+  for (const i of items) counts[i.status]++;
+  return { items, counts, formulaError: plan.formulaError };
 }

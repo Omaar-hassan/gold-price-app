@@ -47,6 +47,9 @@ const PRODUCTS_QUERY = `#graphql
         tags
         featuredMedia { preview { image { url(transform: { maxWidth: 80, maxHeight: 80 }) } } }
         metafields(first: 15) { nodes { namespace key value } }
+        fixMetal: metafield(namespace: "gold_price", key: "metal") { value }
+        fixKarat: metafield(namespace: "gold_price", key: "karat") { value }
+        fixOrigin: metafield(namespace: "gold_price", key: "origin") { value }
         variants(first: 25) {
           pageInfo { hasNextPage }
           nodes {
@@ -55,6 +58,7 @@ const PRODUCTS_QUERY = `#graphql
             price
             sku
             inventoryItem { measurement { weight { unit value } } }
+            fixWeight: metafield(namespace: "gold_price", key: "metal_weight") { value }
           }
         }
       }
@@ -73,6 +77,7 @@ const EXTRA_VARIANTS_QUERY = `#graphql
           price
           sku
           inventoryItem { measurement { weight { unit value } } }
+          fixWeight: metafield(namespace: "gold_price", key: "metal_weight") { value }
         }
       }
     }
@@ -99,6 +104,8 @@ function mapVariant(v) {
     price: v.price,
     sku: v.sku,
     weightGrams: grams,
+    // Weight set with the Fix form (variant metafield gold_price.metal_weight).
+    fixWeight: v.fixWeight?.value ?? null,
   };
 }
 
@@ -132,11 +139,26 @@ export async function fetchAllProducts(admin) {
         productType: p.productType,
         tags: p.tags || [],
         image: p.featuredMedia?.preview?.image?.url || null,
-        metafields: p.metafields.nodes.map((m) => ({
-          namespace: m.namespace,
-          key: m.key,
-          value: m.value,
-        })),
+        metafields: [
+          ...p.metafields.nodes.map((m) => ({
+            namespace: m.namespace,
+            key: m.key,
+            value: m.value,
+          })),
+          // Values set with the Fix form, read explicitly so they are never cut
+          // off by the 15-metafield limit above.
+          ...[
+            ["metal", p.fixMetal],
+            ["karat", p.fixKarat],
+            ["origin", p.fixOrigin],
+          ]
+            .filter(([, m]) => m?.value)
+            .map(([key, m]) => ({
+              namespace: "gold_price",
+              key,
+              value: m.value,
+            })),
+        ],
         variants,
       });
     }
@@ -509,4 +531,39 @@ export async function markUndone(id) {
     console.error("[gold-price] could not mark run as undone:", error.message);
     return null;
   }
+}
+
+const FIX_SAVE = `#graphql
+  mutation SaveProductFix($metafields: [MetafieldsSetInput!]!) {
+    metafieldsSet(metafields: $metafields) {
+      userErrors { field message }
+    }
+  }
+`;
+
+/**
+ * Save what the merchant entered in the Products screen's Fix form as metafields
+ * (namespace gold_price). Metal, purity and origin go on the product (all its
+ * variants); weight goes on the one variant. Never touches prices. Only the given
+ * fields are written; values must already be validated.
+ * fix: { metal?: "gold" | "silver", karat?: "21K" | "S925" ..., origin?: "local" | "imported", weight?: grams }
+ */
+export async function saveProductFix(admin, productId, variantId, fix) {
+  const metafields = [];
+  const add = (key, type, value, ownerId = productId) =>
+    metafields.push({
+      ownerId,
+      namespace: "gold_price",
+      key,
+      type,
+      value: String(value),
+    });
+  if (fix.metal) add("metal", "single_line_text_field", fix.metal);
+  if (fix.karat) add("karat", "single_line_text_field", fix.karat);
+  if (fix.origin) add("origin", "single_line_text_field", fix.origin);
+  if (fix.weight) add("metal_weight", "number_decimal", fix.weight, variantId);
+  if (!metafields.length) return;
+  const result = await gql(admin, FIX_SAVE, { metafields });
+  const errors = result.metafieldsSet.userErrors;
+  if (errors?.length) throw new Error(errors.map((e) => e.message).join(", "));
 }
