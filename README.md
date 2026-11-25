@@ -3,7 +3,7 @@
 Shopify app that keeps jewelry prices in sync with the global gold price.
 
 - **Live price**: XAU/USD spot from [gold-api.com](https://gold-api.com) and USD→EGP from [open.er-api.com](https://open.er-api.com), with a daily fallback from currency-api. All free, no API key. Refreshed every 30 seconds on the dashboard.
-- **Price formula**: `(karat price per gram + workmanship per gram) × weight − discount`, rounded. Karat price = 24k price × karat ÷ 24, plus an optional market premium or a manual price per karat.
+- **Price formulas**: 5 ready-made formulas (Classic, With wastage, Egypt style, Full cost plus profit, Making % of gold value), all editable, plus the store's own. Formulas use fixed building blocks (`metal_price`, `weight`, `making`, `making_pct`, `wastage_pct`, `stone_cost`, `fixed_fee`, `profit_pct`, `discount`) and are parsed safely in `app/lib/formula.js` (no `eval`). VAT is a separate setting (on total or workmanship only), added after the formula, and is switched off when Shopify adds tax at checkout. Metal price per gram = spot × purity, plus an optional market premium or a manual price per purity.
 - **Preview before applying**: see every old vs new price, skipped products and big changes, pick which to apply, and undo the last run.
 - Product matching rules live in `app/lib/pricing.js` (unit tests: `npm test`).
 
