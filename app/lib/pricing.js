@@ -404,6 +404,8 @@ export function weightFromSku(sku) {
   for (let i = parts.length - 1; i >= 0; i--) {
     const part = parts[i];
     if (/^\d+(?:[.,]\d+)?$/.test(part)) {
+      // Zero-padded numbers ("001", "07") are item codes, not weights.
+      if (/^0\d/.test(part)) return null;
       const n = toNumber(part.replace(",", "."), 0);
       if (n > 0 && n < 1000) return n;
       return null;

@@ -24,6 +24,10 @@ test("SKU weight uses the last number, not the karat", () => {
   assert.equal(weightFromSku("RING-5G"), 5);
   assert.equal(weightFromSku("GLD-21K"), null);
   assert.equal(weightFromSku(""), null);
+  // Zero-padded item numbers are not weights.
+  assert.equal(weightFromSku("LMP-AUR-001"), null);
+  assert.equal(weightFromSku("PLN-HNG-003"), null);
+  assert.equal(weightFromSku("GLD-21K-0.8"), 0.8);
 });
 
 test("titles need an explicit gram unit", () => {
