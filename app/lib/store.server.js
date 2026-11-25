@@ -306,32 +306,51 @@ const SETTINGS_SAVE = `#graphql
 
 function parseSettings(text) {
   try {
-    return normalizeSettings(JSON.parse(text));
+    // Settings saved before multi-currency have no currency: they were all EGP.
+    return normalizeSettings({ currency: "EGP", ...JSON.parse(text) });
   } catch {
     return null;
   }
 }
 
+const SHOP_INFO_TTL_MS = 5 * 60 * 1000;
+const shopInfoCache = new Map(); // shop -> { info, at }
+
 /**
- * Shopify's "Include tax in product prices" setting.
- * true  = prices include tax, so the app may add VAT to the price.
- * false = Shopify adds tax at checkout, so the app must not add VAT (double VAT).
- * null  = could not be read.
+ * The store facts pricing depends on, read from Shopify (cached 5 minutes per shop):
+ * - currency: the store currency (shop.currencyCode), which product prices are saved
+ *   in. All prices the app writes are in this currency. null = could not be read.
+ * - taxesIncluded: Shopify's "Include tax in product prices" setting.
+ *   true  = prices include tax, so the app may add VAT to the price.
+ *   false = Shopify adds tax at checkout, so the app must not add VAT (double VAT).
+ *   null  = could not be read.
+ * - timeZone: the store's time zone (IANA name), for showing dates.
  */
-export async function fetchTaxesIncluded(admin) {
+export async function fetchShopInfo(admin, shop) {
+  const hit = shopInfoCache.get(shop);
+  if (hit && Date.now() - hit.at < SHOP_INFO_TTL_MS) return hit.info;
   try {
     const data = await gql(
       admin,
       `#graphql
-      query ShopTax { shop { taxesIncluded } }
+      query ShopInfo { shop { currencyCode taxesIncluded ianaTimezone } }
     `,
     );
-    return typeof data?.shop?.taxesIncluded === "boolean"
-      ? data.shop.taxesIncluded
-      : null;
+    const info = {
+      currency: /^[A-Z]{3}$/.test(data?.shop?.currencyCode || "")
+        ? data.shop.currencyCode
+        : null,
+      taxesIncluded:
+        typeof data?.shop?.taxesIncluded === "boolean"
+          ? data.shop.taxesIncluded
+          : null,
+      timeZone: data?.shop?.ianaTimezone || null,
+    };
+    if (info.currency) shopInfoCache.set(shop, { info, at: Date.now() });
+    return info;
   } catch (error) {
-    console.error("[gold-price] could not read tax setting:", error.message);
-    return null;
+    console.error("[gold-price] could not read shop info:", error.message);
+    return { currency: null, taxesIncluded: null, timeZone: null };
   }
 }
 
@@ -361,8 +380,14 @@ export async function loadSettings(admin, shop) {
   return normalizeSettings({});
 }
 
-export async function saveSettings(admin, shop, settings) {
-  const clean = normalizeSettings(settings);
+// currency: the store currency the amounts are in (from fetchShopInfo, never from
+// the browser; falls back to the currency already on the settings only when Shopify
+// could not be read). It is stamped on the saved settings.
+export async function saveSettings(admin, shop, settings, currency) {
+  const clean = normalizeSettings({
+    ...settings,
+    currency: currency || settings?.currency || "",
+  });
   const value = JSON.stringify(clean);
   let saved = false;
   let lastError = null;

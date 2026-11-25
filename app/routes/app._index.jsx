@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { json } from "@remix-run/node";
 import { useLoaderData, useRouteError } from "@remix-run/react";
 import {
@@ -32,7 +40,7 @@ import {
   applyPrices,
   claimPreview,
   fetchAllProducts,
-  fetchTaxesIncluded,
+  fetchShopInfo,
   fetchVariantPrices,
   getRun,
   loadSettings,
@@ -74,15 +82,49 @@ export const shouldRevalidate = ({ formMethod, defaultShouldRevalidate }) =>
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
-  const [live, settings, runs, history, taxesIncluded] = await Promise.all([
-    getLiveGoldPrice(),
+  const [shopInfo, settings, runs] = await Promise.all([
+    fetchShopInfo(admin, session.shop),
     loadSettings(admin, session.shop),
     recentRuns(session.shop),
-    recentRates(14),
-    fetchTaxesIncluded(admin),
   ]);
-  return json({ live, settings, runs, history, taxesIncluded });
+  // Everything is priced in the store's Shopify currency. If Shopify can't be read
+  // right now, show the last saved currency (price updates stay blocked until it can).
+  const currency = shopInfo.currency || settings.currency || "USD";
+  const [live, history] = await Promise.all([
+    getLiveGoldPrice(currency),
+    recentRates(14, currency),
+  ]);
+  return json({
+    live,
+    settings,
+    runs,
+    history,
+    taxesIncluded: shopInfo.taxesIncluded,
+    shop: {
+      currency,
+      currencyKnown: Boolean(shopInfo.currency),
+      timeZone: shopInfo.timeZone || "UTC",
+    },
+  });
 };
+
+// Why a preview can't run, or null. Each reason is a clear message instead of
+// pricing with a wrong currency or an old exchange rate.
+async function currencyProblem(admin, shop, shopInfo) {
+  if (!shopInfo.currency)
+    return "We couldn't read your store currency from Shopify, so no prices were calculated. Please try again in a minute.";
+  const stored = await loadSettings(admin, shop);
+  if (stored.currency && stored.currency !== shopInfo.currency)
+    return `Your saved amounts (making charges, fees, manual prices) are in ${stored.currency}, but your store currency is now ${shopInfo.currency}. Check them, then press Save settings to confirm they are in ${shopInfo.currency}.`;
+  return null;
+}
+
+function rateProblem(currency, settings, live) {
+  if (settings.usdEgpOverride || !live.fx.outdated) return null;
+  return live.usdRate
+    ? `The USD → ${currency} exchange rate is out of date (last updated ${live.fx.updatedAt ? new Date(live.fx.updatedAt).toUTCString() : "unknown"}), so no prices were calculated. Try again later, or enter a manual exchange rate under Metal prices.`
+    : `The USD → ${currency} exchange rate is unavailable (${live.fx.error || "unknown error"}), so no prices were calculated. Try again later, or enter a manual exchange rate under Metal prices.`;
+}
 
 export const action = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
@@ -91,13 +133,31 @@ export const action = async ({ request }) => {
 
   try {
     if (body.intent === "save") {
-      const settings = await saveSettings(admin, shop, body.settings);
+      const shopInfo = await fetchShopInfo(admin, shop);
+      const settings = await saveSettings(
+        admin,
+        shop,
+        body.settings,
+        shopInfo.currency,
+      );
       return json({ intent: "save", ok: true, settings });
     }
 
     if (body.intent === "preview") {
-      const settings = await saveSettings(admin, shop, body.settings);
-      const live = await getLiveGoldPrice();
+      const shopInfo = await fetchShopInfo(admin, shop);
+      const blocked = await currencyProblem(admin, shop, shopInfo);
+      if (blocked)
+        return json({ intent: "preview", error: blocked }, { status: 409 });
+      const settings = await saveSettings(
+        admin,
+        shop,
+        body.settings,
+        shopInfo.currency,
+      );
+      const live = await getLiveGoldPrice(shopInfo.currency);
+      const rateBlocked = rateProblem(shopInfo.currency, settings, live);
+      if (rateBlocked)
+        return json({ intent: "preview", error: rateBlocked }, { status: 503 });
       const prices = karatPrices(live, settings);
       const anyPrice = Object.values(prices.byKarat).some((p) => p.price > 0);
       if (!anyPrice) {
@@ -110,10 +170,8 @@ export const action = async ({ request }) => {
           { status: 503 },
         );
       }
-      const [products, taxesIncluded] = await Promise.all([
-        fetchAllProducts(admin),
-        fetchTaxesIncluded(admin),
-      ]);
+      const products = await fetchAllProducts(admin);
+      const { taxesIncluded } = shopInfo;
       const images = Object.fromEntries(products.map((p) => [p.id, p.image]));
       const plan = buildPlan(products, settings, prices, { taxesIncluded });
       if (plan.formulaError) {
@@ -125,7 +183,8 @@ export const action = async ({ request }) => {
       const snapshot = {
         gram24: prices.gram24,
         usdPerOunce: prices.usdPerOunce,
-        usdEgp: prices.usdEgp,
+        usdEgp: prices.usdRate,
+        currency: shopInfo.currency,
         byKarat: prices.byKarat,
         at: new Date().toISOString(),
       };
@@ -246,16 +305,52 @@ export const action = async ({ request }) => {
 // Formatting
 // ---------------------------------------------------------------------------
 
-const egp = new Intl.NumberFormat("en-US", {
-  style: "currency",
-  currency: "EGP",
-  maximumFractionDigits: 2,
-});
-const egp0 = new Intl.NumberFormat("en-US", {
-  style: "currency",
-  currency: "EGP",
-  maximumFractionDigits: 0,
-});
+// Money is always shown in the store's Shopify currency.
+function moneyFormat(currency, digits) {
+  const base = { style: "currency", currency, maximumFractionDigits: digits };
+  try {
+    return new Intl.NumberFormat("en-US", base);
+  } catch {
+    try {
+      // Currencies with more decimals by default (e.g. KWD) need a lower minimum.
+      return new Intl.NumberFormat("en-US", {
+        ...base,
+        minimumFractionDigits: 0,
+      });
+    } catch {
+      const n = new Intl.NumberFormat("en-US", {
+        maximumFractionDigits: digits,
+      });
+      return { format: (v) => `${currency} ${n.format(v)}` };
+    }
+  }
+}
+
+function shopFormat({ currency = "EGP", timeZone = "Africa/Cairo" } = {}) {
+  let tz = timeZone;
+  try {
+    new Intl.DateTimeFormat("en-GB", { timeZone: tz });
+  } catch {
+    tz = "UTC";
+  }
+  return {
+    currency,
+    money: moneyFormat(currency, 2),
+    money0: moneyFormat(currency, 0),
+    // Fixed (store) time zone so the server and the browser show the same time.
+    formatDate: (iso) =>
+      new Date(iso).toLocaleString("en-GB", {
+        timeZone: tz,
+        day: "numeric",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+  };
+}
+
+const ShopContext = createContext(shopFormat());
+const useShop = () => useContext(ShopContext);
 const usd = new Intl.NumberFormat("en-US", {
   style: "currency",
   currency: "USD",
@@ -273,17 +368,6 @@ function timeAgo(iso, now) {
   const h = Math.round(m / 60);
   if (h < 48) return `${h} h ago`;
   return new Date(iso).toLocaleDateString("en-GB");
-}
-
-function formatDate(iso) {
-  // Fixed time zone so the server and the browser show the same time.
-  return new Date(iso).toLocaleString("en-GB", {
-    timeZone: "Africa/Cairo",
-    day: "numeric",
-    month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -323,15 +407,16 @@ function LiveHero({
   live,
   gram24,
   gramSilver,
-  usdEgp,
+  usdRate,
   now,
   trend,
   onRefresh,
   refreshing,
 }) {
+  const { money, currency } = useShop();
   const status = !live.ok
     ? "down"
-    : live.gold.stale || live.fx.stale
+    : live.gold.stale || live.fx.stale || live.fx.outdated
       ? "stale"
       : "live";
   const statusText =
@@ -354,7 +439,7 @@ function LiveHero({
           <BlockStack gap="100">
             <span className="gpe-hero-label">24k gold · per gram</span>
             <span className="gpe-hero-price">
-              {gram24 > 0 ? egp.format(gram24) : "—"}
+              {gram24 > 0 ? money.format(gram24) : "—"}
             </span>
             {trend ? (
               <span className={trend > 0 ? "gpe-up" : "gpe-downtxt"}>
@@ -368,7 +453,7 @@ function LiveHero({
           <BlockStack gap="100">
             <span className="gpe-hero-label">Fine silver · per gram</span>
             <span className="gpe-hero-price small">
-              {gramSilver > 0 ? egp.format(gramSilver) : "—"}
+              {gramSilver > 0 ? money.format(gramSilver) : "—"}
             </span>
             <span className="gpe-hero-sub">
               {live.silverUsdPerOunce
@@ -388,9 +473,9 @@ function LiveHero({
             </span>
           </BlockStack>
           <BlockStack gap="100">
-            <span className="gpe-hero-label">USD → EGP</span>
+            <span className="gpe-hero-label">USD → {currency}</span>
             <span className="gpe-hero-price small">
-              {usdEgp ? num.format(usdEgp) : "—"}
+              {usdRate ? num.format(usdRate) : "—"}
             </span>
             <span className="gpe-hero-sub">
               {live.fx.source || "no source"}
@@ -403,6 +488,7 @@ function LiveHero({
 }
 
 function KaratCards({ prices, settings }) {
+  const { money0 } = useShop();
   const card = (p) => {
     const price = prices.byKarat[p.key];
     const included = settings.includeKarats.includes(p.key);
@@ -422,7 +508,7 @@ function KaratCards({ prices, settings }) {
             )}
           </InlineStack>
           <span className="gpe-karat-p">
-            {price.price > 0 ? egp0.format(price.price) : "—"}
+            {price.price > 0 ? money0.format(price.price) : "—"}
           </span>
           <Text as="span" variant="bodySm" tone="subdued">
             per gram · {Math.round(p.fraction * 1000) / 10}% {p.metal}
@@ -444,6 +530,7 @@ function KaratCards({ prices, settings }) {
 }
 
 function RateHistory({ history }) {
+  const { money, money0 } = useShop();
   if (!history?.length)
     return (
       <Text as="p" tone="subdued">
@@ -464,8 +551,8 @@ function RateHistory({ history }) {
           {history.map((h) => (
             <tr key={h.day}>
               <td>{h.day}</td>
-              <td>{h.gold ? egp0.format(h.gold) : "—"}</td>
-              <td>{h.silver ? egp.format(h.silver) : "—"}</td>
+              <td>{h.gold ? money0.format(h.gold) : "—"}</td>
+              <td>{h.silver ? money.format(h.silver) : "—"}</td>
             </tr>
           ))}
         </tbody>
@@ -479,6 +566,7 @@ const activeFormulaOf = (settings) =>
   settings.formulas[0];
 
 function FormulaCard({ settings, setSettings, prices, taxesIncluded }) {
+  const { money, currency } = useShop();
   const [newName, setNewName] = useState("");
   const formula =
     settings.formulas.find((f) => f.id === settings.activeFormulaId) ||
@@ -620,7 +708,7 @@ function FormulaCard({ settings, setSettings, prices, taxesIncluded }) {
                     <code>{v.name}</code>
                   </td>
                   <td>{v.label}</td>
-                  <td>{v.unit}</td>
+                  <td>{v.unit.replace("{currency}", currency)}</td>
                 </tr>
               ))}
             </tbody>
@@ -663,10 +751,10 @@ function FormulaCard({ settings, setSettings, prices, taxesIncluded }) {
           ) : example ? (
             <Text as="p" variant="bodySm">
               Example: {purityLabel(exampleKey)}, 5 g, local making charge →
-              before VAT {egp.format(example.preVat)}
+              before VAT {money.format(example.preVat)}
               {example.vat > 0
-                ? ` + VAT ${egp.format(example.vat)}`
-                : ""} = <strong>{egp.format(example.price)}</strong>
+                ? ` + VAT ${money.format(example.vat)}`
+                : ""} = <strong>{money.format(example.price)}</strong>
             </Text>
           ) : (
             <Text as="p" variant="bodySm" tone="subdued">
@@ -685,8 +773,8 @@ function FormulaCard({ settings, setSettings, prices, taxesIncluded }) {
           <code>wastage_pct</code>, <code>making_pct</code>,{" "}
           <code>fixed_fee</code>, <code>profit_pct</code>) overrides them for
           that product. Stone / diamond cost is set per product in a{" "}
-          <code>stone_cost</code> metafield (EGP, total per piece). Each cost is
-          only used if your formula includes it.
+          <code>stone_cost</code> metafield ({currency}, total per piece). Each
+          cost is only used if your formula includes it.
         </Text>
         <InlineGrid columns={{ xs: 1, sm: 2 }} gap="300">
           <TextField
@@ -708,7 +796,7 @@ function FormulaCard({ settings, setSettings, prices, taxesIncluded }) {
           <TextField
             label="Fixed fee"
             type="number"
-            prefix="EGP"
+            prefix={currency}
             suffix="per piece"
             value={String(settings.fixedFee)}
             onChange={(v) => update({ fixedFee: v })}
@@ -789,6 +877,7 @@ function ChangeBadge({ row }) {
 }
 
 function PreviewTable({ rows, selected, onSelect }) {
+  const { money } = useShop();
   const resourceName = { singular: "variant", plural: "variants" };
   const items = rows.map((r) => ({ ...r, id: r.variantId }));
   const { selectedResources, allResourcesSelected, handleSelectionChange } =
@@ -865,12 +954,12 @@ function PreviewTable({ rows, selected, onSelect }) {
           </IndexTable.Cell>
           <IndexTable.Cell>
             <Text as="span" alignment="end" numeric tone="subdued">
-              {egp.format(r.currentPrice)}
+              {money.format(r.currentPrice)}
             </Text>
           </IndexTable.Cell>
           <IndexTable.Cell>
             <Text as="span" alignment="end" numeric fontWeight="semibold">
-              {egp.format(r.newPrice)}
+              {money.format(r.newPrice)}
             </Text>
           </IndexTable.Cell>
           <IndexTable.Cell>
@@ -945,6 +1034,10 @@ function SkippedTable({ skipped }) {
 
 export default function Dashboard() {
   const data = useLoaderData();
+  const shop = useMemo(() => shopFormat(data.shop), [data.shop]);
+  const { money, money0, currency, formatDate } = shop;
+  // The currency the saved amounts are in (empty for a store that never saved).
+  const [savedCurrency, setSavedCurrency] = useState(data.settings.currency);
   const [refreshing, setRefreshing] = useState(false);
   const [busyIntent, setBusyIntent] = useState(null);
 
@@ -998,8 +1091,10 @@ export default function Dashboard() {
       setNotice({ tone: "critical", title: d.error });
       return;
     }
-    if (d.intent === "save")
+    if (d.intent === "save") {
       setNotice({ tone: "success", title: "Settings saved." });
+      if (d.settings?.currency) setSavedCurrency(d.settings.currency);
+    }
     if (d.intent === "preview") {
       setPreview(d);
       setSelected(d.rows.filter((r) => !r.unchanged).map((r) => r.variantId));
@@ -1113,548 +1208,600 @@ export default function Dashboard() {
     (r) => r.kind === "apply" && !r.undone && r.updatedCount > 0,
   );
 
+  const currencyMismatch =
+    data.shop.currencyKnown && savedCurrency && savedCurrency !== currency;
+  const rateOutdated =
+    currency !== "USD" && live.fx.outdated && !settings.usdEgpOverride;
+
   return (
-    <Page
-      title="Gold Price Editor"
-      subtitle="Keep your jewelry prices in sync with the global gold price"
-      primaryAction={{
-        content: "Preview new prices",
-        onAction: () => submit({ intent: "preview", settings }),
-        loading: busyIntent === "preview",
-        disabled: busy,
-      }}
-    >
-      <TitleBar title="Gold Price Editor" />
-      {/* As raw HTML: React escapes ">" in style text on the server, which broke hydration. */}
-      <style dangerouslySetInnerHTML={{ __html: STYLES }} />
+    <ShopContext.Provider value={shop}>
+      <Page
+        title="Gold Price Editor"
+        subtitle="Keep your jewelry prices in sync with the global gold price"
+        primaryAction={{
+          content: "Preview new prices",
+          onAction: () => submit({ intent: "preview", settings }),
+          loading: busyIntent === "preview",
+          disabled: busy,
+        }}
+      >
+        <TitleBar title="Gold Price Editor" />
+        {/* As raw HTML: React escapes ">" in style text on the server, which broke hydration. */}
+        <style dangerouslySetInnerHTML={{ __html: STYLES }} />
 
-      <BlockStack gap="500">
-        <LiveHero
-          live={live}
-          gram24={prices.gram24}
-          gramSilver={prices.gramSilver}
-          usdEgp={prices.usdEgp}
-          now={now}
-          trend={trend}
-          onRefresh={refreshLive}
-          refreshing={refreshing}
-        />
+        <BlockStack gap="500">
+          <LiveHero
+            live={live}
+            gram24={prices.gram24}
+            gramSilver={prices.gramSilver}
+            usdRate={prices.usdRate}
+            now={now}
+            trend={trend}
+            onRefresh={refreshLive}
+            refreshing={refreshing}
+          />
 
-        {!live.ok && (
-          <Banner tone="warning" title="Live price unavailable">
-            <p>
-              We couldn&apos;t reach the gold price service (
-              {live.gold.error || live.fx.error || "unknown error"}). You can
-              still update prices by entering a manual price per gram below.
-            </p>
-          </Banner>
-        )}
+          {!live.ok && (
+            <Banner tone="warning" title="Live price unavailable">
+              <p>
+                We couldn&apos;t reach the gold price service (
+                {live.gold.error || live.fx.error || "unknown error"}). You can
+                still update prices by entering a manual price per gram below.
+              </p>
+            </Banner>
+          )}
 
-        <KaratCards prices={prices} settings={settings} />
+          {!data.shop.currencyKnown && (
+            <Banner tone="critical" title="Store currency unknown">
+              <p>
+                We couldn&apos;t read your store currency from Shopify, so
+                prices are shown in {currency} for now and price updates are
+                paused. Reload the page in a minute.
+              </p>
+            </Banner>
+          )}
 
-        {notice && (
-          <Banner
-            tone={notice.tone}
-            title={notice.title}
-            onDismiss={() => setNotice(null)}
-          >
-            {notice.errors?.length > 0 && (
-              <BlockStack gap="100">
-                {notice.errors.map((e) => (
-                  <Text as="p" key={e.productId}>
-                    {e.productTitle}: {e.message}
-                  </Text>
-                ))}
-              </BlockStack>
-            )}
-          </Banner>
-        )}
+          {currencyMismatch && (
+            <Banner tone="critical" title="Your store currency has changed">
+              <p>
+                Your saved amounts (making charges, fees, discount, manual
+                prices) were entered in {savedCurrency}, but your store now uses{" "}
+                {currency}. Check every amount below, then press Save settings
+                to confirm they are in {currency}. Price updates are paused
+                until then.
+              </p>
+            </Banner>
+          )}
 
-        {preview && (
-          <Card padding="0">
-            <Box padding="400">
-              <BlockStack gap="400">
-                <InlineStack
-                  align="space-between"
-                  blockAlign="center"
-                  gap="300"
-                >
-                  <BlockStack gap="100">
-                    <Text as="h2" variant="headingLg">
-                      Price preview
+          {live.ok && rateOutdated && (
+            <Banner
+              tone="critical"
+              title={`USD → ${currency} rate is out of date`}
+            >
+              <p>
+                The exchange rate was last updated{" "}
+                {live.fx.updatedAt
+                  ? formatDate(live.fx.updatedAt)
+                  : "at an unknown time"}
+                , so price updates are paused instead of using an old rate. This
+                usually fixes itself within a day, or you can enter a manual
+                exchange rate under Metal prices.
+              </p>
+            </Banner>
+          )}
+
+          <KaratCards prices={prices} settings={settings} />
+
+          {notice && (
+            <Banner
+              tone={notice.tone}
+              title={notice.title}
+              onDismiss={() => setNotice(null)}
+            >
+              {notice.errors?.length > 0 && (
+                <BlockStack gap="100">
+                  {notice.errors.map((e) => (
+                    <Text as="p" key={e.productId}>
+                      {e.productTitle}: {e.message}
                     </Text>
-                    <Text as="p" tone="subdued">
-                      Based on 24k at {egp.format(preview.snapshot.gram24)} / g
-                      · {formatDate(preview.snapshot.at)} ·{" "}
-                      {preview.productCount} products scanned
-                    </Text>
-                    {preview.vatBlocked && (
-                      <Text as="p" variant="bodySm" tone="caution">
-                        VAT was not added: your Shopify store adds tax at
-                        checkout.
-                      </Text>
-                    )}
-                  </BlockStack>
-                  <InlineStack gap="200">
-                    <Button onClick={() => setPreview(null)} disabled={busy}>
-                      Discard
-                    </Button>
-                    <Button
-                      variant="primary"
-                      tone={flaggedSelected ? "critical" : undefined}
-                      disabled={!selectedRows.length || busy}
-                      onClick={() => setConfirming(true)}
-                    >
-                      {`Apply ${selectedRows.length} price${selectedRows.length === 1 ? "" : "s"}`}
-                    </Button>
-                  </InlineStack>
-                </InlineStack>
-
-                <InlineGrid columns={{ xs: 2, md: 4 }} gap="300">
-                  <Stat
-                    label="Will change"
-                    value={preview.rows.filter((r) => !r.unchanged).length}
-                  />
-                  <Stat
-                    label="Already correct"
-                    value={preview.rows.filter((r) => r.unchanged).length}
-                  />
-                  <Stat
-                    label={`Change over ${settings.warnChangePct}%`}
-                    value={preview.rows.filter((r) => r.flagged).length}
-                    tone={
-                      preview.rows.some((r) => r.flagged)
-                        ? "critical"
-                        : undefined
-                    }
-                  />
-                  <Stat
-                    label="Skipped"
-                    value={preview.skipped.length}
-                    tone={preview.skipped.length ? "caution" : undefined}
-                  />
-                </InlineGrid>
-
-                {confirming && (
-                  <Banner
-                    tone={flaggedSelected ? "critical" : "info"}
-                    title={`Update ${selectedRows.length} prices in your store now?`}
-                    action={{
-                      content: "Yes, apply prices",
-                      loading: busyIntent === "apply",
-                      onAction: () =>
-                        submit({
-                          intent: "apply",
-                          previewId: preview.previewId,
-                          variantIds: selectedRows.map((r) => r.variantId),
-                        }),
-                    }}
-                    secondaryAction={{
-                      content: "Cancel",
-                      onAction: () => setConfirming(false),
-                    }}
-                  >
-                    <p>
-                      {flaggedSelected
-                        ? `${flaggedSelected} of them change by more than ${settings.warnChangePct}%. Check them first. `
-                        : ""}
-                      You can undo this run from the history card.
-                    </p>
-                  </Banner>
-                )}
-              </BlockStack>
-            </Box>
-            <Tabs
-              tabs={[
-                { id: "update", content: `To update (${preview.rows.length})` },
-                {
-                  id: "skipped",
-                  content: `Skipped (${preview.skipped.length})`,
-                },
-              ]}
-              selected={tab}
-              onSelect={setTab}
-            />
-            {tab === 0 ? (
-              preview.rows.length ? (
-                <PreviewTable
-                  key={preview.snapshot.at}
-                  rows={preview.rows}
-                  selected={selected}
-                  onSelect={setSelected}
-                />
-              ) : (
-                <EmptyState heading="No matching products" image="">
-                  <p>
-                    Check the Skipped tab to see why products weren&apos;t
-                    matched.
-                  </p>
-                </EmptyState>
-              )
-            ) : (
-              <SkippedTable skipped={preview.skipped} />
-            )}
-          </Card>
-        )}
-
-        <Layout>
-          <Layout.Section>
-            <BlockStack gap="400">
-              <Card>
-                <BlockStack gap="400">
-                  <BlockStack gap="100">
-                    <Text as="h2" variant="headingMd">
-                      Metal prices
-                    </Text>
-                    <Text as="p" tone="subdued">
-                      Prices come from the global gold and silver spot prices,
-                      converted to EGP per gram. Leave a price empty to use the
-                      live price, or type a price to fix it manually.
-                    </Text>
-                  </BlockStack>
-                  <InlineGrid columns={{ xs: 1, sm: 3 }} gap="300">
-                    <TextField
-                      label="Gold market premium"
-                      type="number"
-                      suffix="%"
-                      value={String(settings.premiumPct)}
-                      onChange={(v) => set("premiumPct", v)}
-                      helpText="Added to the spot price to match the local market. Can be negative."
-                      autoComplete="off"
-                    />
-                    <TextField
-                      label="Silver market premium"
-                      type="number"
-                      suffix="%"
-                      value={String(settings.silverPremiumPct)}
-                      onChange={(v) => set("silverPremiumPct", v)}
-                      helpText="Same, for silver."
-                      autoComplete="off"
-                    />
-                    <TextField
-                      label="USD → EGP rate"
-                      type="number"
-                      value={settings.usdEgpOverride}
-                      onChange={(v) => set("usdEgpOverride", v)}
-                      placeholder={
-                        live.usdEgp
-                          ? `Live: ${num.format(live.usdEgp)}`
-                          : "Enter a rate"
-                      }
-                      helpText="Leave empty to use the live rate."
-                      autoComplete="off"
-                    />
-                  </InlineGrid>
-                  <Divider />
-                  <div className="gpe-scroll">
-                    <table className="gpe-matrix">
-                      <thead>
-                        <tr>
-                          <th>Purity</th>
-                          <th>Update</th>
-                          <th>Price / g (empty = live)</th>
-                          <th>Workmanship / g · local</th>
-                          <th>Workmanship / g · imported</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {PURITIES.map(({ key: k, label }) => (
-                          <tr key={k}>
-                            <td>
-                              <Text as="span" fontWeight="semibold">
-                                {label}
-                              </Text>
-                            </td>
-                            <td>
-                              <Checkbox
-                                label={`Update ${label} products`}
-                                labelHidden
-                                checked={settings.includeKarats.includes(k)}
-                                onChange={(on) => toggleKarat(k, on)}
-                              />
-                            </td>
-                            <td>
-                              <TextField
-                                label={`${label} price per gram`}
-                                labelHidden
-                                type="number"
-                                value={settings.karatOverrides[k]}
-                                placeholder={
-                                  prices.byKarat[k].livePrice > 0
-                                    ? num.format(
-                                        Math.round(
-                                          prices.byKarat[k].livePrice * 100,
-                                        ) / 100,
-                                      )
-                                    : "Manual"
-                                }
-                                onChange={(v) => setOverride(k, v)}
-                                autoComplete="off"
-                              />
-                            </td>
-                            <td>
-                              <TextField
-                                label={`${label} local workmanship`}
-                                labelHidden
-                                type="number"
-                                value={String(settings.making[k].local)}
-                                onChange={(v) => setMaking(k, "local", v)}
-                                autoComplete="off"
-                              />
-                            </td>
-                            <td>
-                              <TextField
-                                label={`${label} imported workmanship`}
-                                labelHidden
-                                type="number"
-                                value={String(settings.making[k].imported)}
-                                onChange={(v) => setMaking(k, "imported", v)}
-                                autoComplete="off"
-                              />
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                  <Text as="p" variant="bodySm" tone="subdued">
-                    A product metafield named <code>making_charge</code>{" "}
-                    overrides the workmanship for that product.
-                  </Text>
+                  ))}
                 </BlockStack>
-              </Card>
+              )}
+            </Banner>
+          )}
 
-              <FormulaCard
-                settings={settings}
-                setSettings={setSettings}
-                prices={prices}
-                taxesIncluded={data.taxesIncluded}
-              />
-
-              <Card>
+          {preview && (
+            <Card padding="0">
+              <Box padding="400">
                 <BlockStack gap="400">
-                  <Text as="h2" variant="headingMd">
-                    Rules
-                  </Text>
-                  <InlineGrid columns={{ xs: 1, sm: 2 }} gap="300">
-                    <TextField
-                      label="Discount per piece"
-                      type="number"
-                      prefix="EGP"
-                      value={String(settings.discountPerPiece)}
-                      onChange={(v) => set("discountPerPiece", v)}
-                      helpText="Taken off the final price of each item."
-                      autoComplete="off"
-                    />
-                    <Select
-                      label="Round prices to"
-                      options={[
-                        { label: "No rounding", value: "0.01" },
-                        { label: "Nearest 1 EGP", value: "1" },
-                        { label: "Nearest 5 EGP", value: "5" },
-                        { label: "Nearest 10 EGP", value: "10" },
-                        { label: "Nearest 50 EGP", value: "50" },
-                        { label: "Nearest 100 EGP", value: "100" },
-                      ]}
-                      value={settings.rounding}
-                      onChange={(v) => set("rounding", v)}
-                    />
-                    <Select
-                      label="Products with no origin"
-                      options={[
-                        { label: "Skip them", value: "skip" },
-                        { label: "Treat as local", value: "local" },
-                        { label: "Treat as imported", value: "imported" },
-                      ]}
-                      value={settings.unknownOrigin}
-                      onChange={(v) => set("unknownOrigin", v)}
-                    />
-                    <TextField
-                      label="Flag changes bigger than"
-                      type="number"
-                      suffix="%"
-                      value={String(settings.warnChangePct)}
-                      onChange={(v) => set("warnChangePct", v)}
-                      autoComplete="off"
-                    />
-                  </InlineGrid>
-                  <InlineStack align="end" gap="200">
-                    <Button
-                      onClick={() => submit({ intent: "save", settings })}
-                      loading={busyIntent === "save"}
-                      disabled={busy}
-                    >
-                      Save settings
-                    </Button>
-                    <Button
-                      variant="primary"
-                      onClick={() => submit({ intent: "preview", settings })}
-                      loading={busyIntent === "preview"}
-                      disabled={busy}
-                    >
-                      Preview new prices
-                    </Button>
-                  </InlineStack>
-                </BlockStack>
-              </Card>
-            </BlockStack>
-          </Layout.Section>
-
-          <Layout.Section variant="oneThird">
-            <BlockStack gap="400">
-              <Card>
-                <BlockStack gap="300">
-                  <Text as="h2" variant="headingMd">
-                    Price formula
-                  </Text>
-                  <Box
-                    background="bg-surface-secondary"
-                    padding="300"
-                    borderRadius="200"
+                  <InlineStack
+                    align="space-between"
+                    blockAlign="center"
+                    gap="300"
                   >
                     <BlockStack gap="100">
-                      <Text as="p" variant="bodySm" fontWeight="semibold">
-                        {activeFormulaOf(settings).name}
+                      <Text as="h2" variant="headingLg">
+                        Price preview
                       </Text>
-                      <Text as="p" variant="bodySm">
-                        <code>{activeFormulaOf(settings).expression}</code>
+                      <Text as="p" tone="subdued">
+                        Based on 24k at {money.format(preview.snapshot.gram24)}{" "}
+                        / g · {formatDate(preview.snapshot.at)} ·{" "}
+                        {preview.productCount} products scanned
                       </Text>
-                      <Text as="p" variant="bodySm" tone="subdued">
-                        {settings.vat.enabled && data.taxesIncluded !== false
-                          ? `+ VAT ${settings.vat.pct}% on ${settings.vat.basis === "workmanship" ? "workmanship" : "the total"}, then rounded.`
-                          : "Then rounded. No VAT."}
-                      </Text>
+                      {preview.vatBlocked && (
+                        <Text as="p" variant="bodySm" tone="caution">
+                          VAT was not added: your Shopify store adds tax at
+                          checkout.
+                        </Text>
+                      )}
                     </BlockStack>
-                  </Box>
-                  <Text as="p" variant="bodySm" tone="subdued">
-                    Karat price = 24k price × karat ÷ 24. 24k price = spot
-                    USD/oz ÷ 31.1035 × USD→EGP × (1 + premium). Silver works the
-                    same way: 925 = 92.5% of the fine silver (999) price.
-                  </Text>
-                </BlockStack>
-              </Card>
+                    <InlineStack gap="200">
+                      <Button onClick={() => setPreview(null)} disabled={busy}>
+                        Discard
+                      </Button>
+                      <Button
+                        variant="primary"
+                        tone={flaggedSelected ? "critical" : undefined}
+                        disabled={!selectedRows.length || busy}
+                        onClick={() => setConfirming(true)}
+                      >
+                        {`Apply ${selectedRows.length} price${selectedRows.length === 1 ? "" : "s"}`}
+                      </Button>
+                    </InlineStack>
+                  </InlineStack>
 
-              <Card>
-                <BlockStack gap="300">
-                  <Text as="h2" variant="headingMd">
-                    History
-                  </Text>
-                  {runs.length === 0 ? (
-                    <Text as="p" tone="subdued">
-                      No price updates yet.
-                    </Text>
-                  ) : (
-                    <BlockStack gap="300">
-                      {runs.map((r) => (
-                        <InlineStack
-                          key={r.id}
-                          align="space-between"
-                          blockAlign="center"
-                          wrap={false}
-                          gap="200"
-                        >
-                          <BlockStack gap="050">
-                            <Text as="span" fontWeight="semibold">
-                              {r.kind === "undo" ? "Undo" : "Update"} ·{" "}
-                              {r.updatedCount} prices
-                            </Text>
-                            <Text as="span" variant="bodySm" tone="subdued">
-                              {formatDate(r.createdAt)}
-                              {r.gram24
-                                ? ` · 24k ${egp0.format(r.gram24)}`
-                                : ""}
-                              {r.failedCount
-                                ? ` · ${r.failedCount} failed`
-                                : ""}
-                            </Text>
-                          </BlockStack>
-                          {r.undone ? (
-                            <Badge>Undone</Badge>
-                          ) : latestUndoable && latestUndoable.id === r.id ? (
-                            <Button
-                              size="slim"
-                              onClick={() =>
-                                submit({ intent: "undo", runId: r.id })
-                              }
-                              loading={busyIntent === "undo"}
-                              disabled={busy}
-                            >
-                              Undo
-                            </Button>
-                          ) : null}
-                        </InlineStack>
-                      ))}
-                    </BlockStack>
+                  <InlineGrid columns={{ xs: 2, md: 4 }} gap="300">
+                    <Stat
+                      label="Will change"
+                      value={preview.rows.filter((r) => !r.unchanged).length}
+                    />
+                    <Stat
+                      label="Already correct"
+                      value={preview.rows.filter((r) => r.unchanged).length}
+                    />
+                    <Stat
+                      label={`Change over ${settings.warnChangePct}%`}
+                      value={preview.rows.filter((r) => r.flagged).length}
+                      tone={
+                        preview.rows.some((r) => r.flagged)
+                          ? "critical"
+                          : undefined
+                      }
+                    />
+                    <Stat
+                      label="Skipped"
+                      value={preview.skipped.length}
+                      tone={preview.skipped.length ? "caution" : undefined}
+                    />
+                  </InlineGrid>
+
+                  {confirming && (
+                    <Banner
+                      tone={flaggedSelected ? "critical" : "info"}
+                      title={`Update ${selectedRows.length} prices in your store now?`}
+                      action={{
+                        content: "Yes, apply prices",
+                        loading: busyIntent === "apply",
+                        onAction: () =>
+                          submit({
+                            intent: "apply",
+                            previewId: preview.previewId,
+                            variantIds: selectedRows.map((r) => r.variantId),
+                          }),
+                      }}
+                      secondaryAction={{
+                        content: "Cancel",
+                        onAction: () => setConfirming(false),
+                      }}
+                    >
+                      <p>
+                        {flaggedSelected
+                          ? `${flaggedSelected} of them change by more than ${settings.warnChangePct}%. Check them first. `
+                          : ""}
+                        You can undo this run from the history card.
+                      </p>
+                    </Banner>
                   )}
                 </BlockStack>
-              </Card>
+              </Box>
+              <Tabs
+                tabs={[
+                  {
+                    id: "update",
+                    content: `To update (${preview.rows.length})`,
+                  },
+                  {
+                    id: "skipped",
+                    content: `Skipped (${preview.skipped.length})`,
+                  },
+                ]}
+                selected={tab}
+                onSelect={setTab}
+              />
+              {tab === 0 ? (
+                preview.rows.length ? (
+                  <PreviewTable
+                    key={preview.snapshot.at}
+                    rows={preview.rows}
+                    selected={selected}
+                    onSelect={setSelected}
+                  />
+                ) : (
+                  <EmptyState heading="No matching products" image="">
+                    <p>
+                      Check the Skipped tab to see why products weren&apos;t
+                      matched.
+                    </p>
+                  </EmptyState>
+                )
+              ) : (
+                <SkippedTable skipped={preview.skipped} />
+              )}
+            </Card>
+          )}
 
-              <Card>
-                <BlockStack gap="300">
-                  <Text as="h2" variant="headingMd">
-                    Market prices, last 14 days
-                  </Text>
-                  <Text as="p" variant="bodySm" tone="subdued">
-                    Pure metal per gram in EGP, before your premium.
-                  </Text>
-                  <RateHistory history={data.history} />
-                </BlockStack>
-              </Card>
-
-              <Card>
-                <BlockStack gap="300">
-                  <InlineStack align="space-between" blockAlign="center">
-                    <Text as="h2" variant="headingMd">
-                      How products are matched
-                    </Text>
-                    <Button
-                      variant="plain"
-                      onClick={() => setHelpOpen((o) => !o)}
-                    >
-                      {helpOpen ? "Hide" : "Show"}
-                    </Button>
-                  </InlineStack>
-                  <Collapsible open={helpOpen} id="gpe-help">
-                    <BlockStack gap="200">
-                      <Text as="p" variant="bodySm">
-                        <strong>Karat</strong>: metafield <code>karat</code>,
-                        then the title, tags, product type or SKU (e.g. “21k”,
-                        “21 karat”, “عيار 21”).
+          <Layout>
+            <Layout.Section>
+              <BlockStack gap="400">
+                <Card>
+                  <BlockStack gap="400">
+                    <BlockStack gap="100">
+                      <Text as="h2" variant="headingMd">
+                        Metal prices
                       </Text>
-                      <Text as="p" variant="bodySm">
-                        <strong>Silver</strong>: a product is silver when its{" "}
-                        <code>metal</code> metafield, title, tags, type or SKU
-                        says “silver”, “sterling” or “فضة”, or carries the 925
-                        hallmark. The purity (925 or 999) is read from the{" "}
-                        <code>purity</code> metafield, then the same places.
-                      </Text>
-                      <Text as="p" variant="bodySm">
-                        <strong>Origin</strong>: metafield <code>origin</code>,
-                        then title, tags or product type (“local”, “محلي”,
-                        “imported”, “مستورد”).
-                      </Text>
-                      <Text as="p" variant="bodySm">
-                        <strong>Weight (grams)</strong>, first match wins:
-                        metafield <code>metal_weight</code>, variant title
-                        (“5.5g”), SKU (the last number, e.g. GLD-21K-LOC-
-                        <strong>5.5</strong>), product title (“5 جرام”), tags,
-                        then the variant&apos;s shipping weight.
-                      </Text>
-                      <Text as="p" variant="bodySm" tone="subdued">
-                        For rings with different sizes, put each size&apos;s
-                        weight in its SKU or variant title rather than in the
-                        product metafield.
+                      <Text as="p" tone="subdued">
+                        Prices come from the global gold and silver spot prices,
+                        converted to {currency} per gram. Leave a price empty to
+                        use the live price, or type a price to fix it manually.
                       </Text>
                     </BlockStack>
-                  </Collapsible>
-                </BlockStack>
-              </Card>
-            </BlockStack>
-          </Layout.Section>
-        </Layout>
-      </BlockStack>
-      <Box paddingBlockEnd="800" />
-    </Page>
+                    <InlineGrid columns={{ xs: 1, sm: 3 }} gap="300">
+                      <TextField
+                        label="Gold market premium"
+                        type="number"
+                        suffix="%"
+                        value={String(settings.premiumPct)}
+                        onChange={(v) => set("premiumPct", v)}
+                        helpText="Added to the spot price to match the local market. Can be negative."
+                        autoComplete="off"
+                      />
+                      <TextField
+                        label="Silver market premium"
+                        type="number"
+                        suffix="%"
+                        value={String(settings.silverPremiumPct)}
+                        onChange={(v) => set("silverPremiumPct", v)}
+                        helpText="Same, for silver."
+                        autoComplete="off"
+                      />
+                      {currency !== "USD" && (
+                        <TextField
+                          label={`USD → ${currency} rate`}
+                          type="number"
+                          value={settings.usdEgpOverride}
+                          onChange={(v) => set("usdEgpOverride", v)}
+                          placeholder={
+                            live.usdRate
+                              ? `Live: ${num.format(live.usdRate)}`
+                              : "Enter a rate"
+                          }
+                          helpText="Leave empty to use the live rate."
+                          autoComplete="off"
+                        />
+                      )}
+                    </InlineGrid>
+                    <Divider />
+                    <div className="gpe-scroll">
+                      <table className="gpe-matrix">
+                        <thead>
+                          <tr>
+                            <th>Purity</th>
+                            <th>Update</th>
+                            <th>Price ({currency}/g, empty = live)</th>
+                            <th>Workmanship ({currency}/g) · local</th>
+                            <th>Workmanship ({currency}/g) · imported</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {PURITIES.map(({ key: k, label }) => (
+                            <tr key={k}>
+                              <td>
+                                <Text as="span" fontWeight="semibold">
+                                  {label}
+                                </Text>
+                              </td>
+                              <td>
+                                <Checkbox
+                                  label={`Update ${label} products`}
+                                  labelHidden
+                                  checked={settings.includeKarats.includes(k)}
+                                  onChange={(on) => toggleKarat(k, on)}
+                                />
+                              </td>
+                              <td>
+                                <TextField
+                                  label={`${label} price per gram`}
+                                  labelHidden
+                                  type="number"
+                                  value={settings.karatOverrides[k]}
+                                  placeholder={
+                                    prices.byKarat[k].livePrice > 0
+                                      ? num.format(
+                                          Math.round(
+                                            prices.byKarat[k].livePrice * 100,
+                                          ) / 100,
+                                        )
+                                      : "Manual"
+                                  }
+                                  onChange={(v) => setOverride(k, v)}
+                                  autoComplete="off"
+                                />
+                              </td>
+                              <td>
+                                <TextField
+                                  label={`${label} local workmanship`}
+                                  labelHidden
+                                  type="number"
+                                  value={String(settings.making[k].local)}
+                                  onChange={(v) => setMaking(k, "local", v)}
+                                  autoComplete="off"
+                                />
+                              </td>
+                              <td>
+                                <TextField
+                                  label={`${label} imported workmanship`}
+                                  labelHidden
+                                  type="number"
+                                  value={String(settings.making[k].imported)}
+                                  onChange={(v) => setMaking(k, "imported", v)}
+                                  autoComplete="off"
+                                />
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      A product metafield named <code>making_charge</code>{" "}
+                      overrides the workmanship for that product.
+                    </Text>
+                  </BlockStack>
+                </Card>
+
+                <FormulaCard
+                  settings={settings}
+                  setSettings={setSettings}
+                  prices={prices}
+                  taxesIncluded={data.taxesIncluded}
+                />
+
+                <Card>
+                  <BlockStack gap="400">
+                    <Text as="h2" variant="headingMd">
+                      Rules
+                    </Text>
+                    <InlineGrid columns={{ xs: 1, sm: 2 }} gap="300">
+                      <TextField
+                        label="Discount per piece"
+                        type="number"
+                        prefix={currency}
+                        value={String(settings.discountPerPiece)}
+                        onChange={(v) => set("discountPerPiece", v)}
+                        helpText="Taken off the final price of each item."
+                        autoComplete="off"
+                      />
+                      <Select
+                        label="Round prices to"
+                        options={[
+                          { label: "No rounding", value: "0.01" },
+                          { label: `Nearest 1 ${currency}`, value: "1" },
+                          { label: `Nearest 5 ${currency}`, value: "5" },
+                          { label: `Nearest 10 ${currency}`, value: "10" },
+                          { label: `Nearest 50 ${currency}`, value: "50" },
+                          { label: `Nearest 100 ${currency}`, value: "100" },
+                        ]}
+                        value={settings.rounding}
+                        onChange={(v) => set("rounding", v)}
+                      />
+                      <Select
+                        label="Products with no origin"
+                        options={[
+                          { label: "Skip them", value: "skip" },
+                          { label: "Treat as local", value: "local" },
+                          { label: "Treat as imported", value: "imported" },
+                        ]}
+                        value={settings.unknownOrigin}
+                        onChange={(v) => set("unknownOrigin", v)}
+                      />
+                      <TextField
+                        label="Flag changes bigger than"
+                        type="number"
+                        suffix="%"
+                        value={String(settings.warnChangePct)}
+                        onChange={(v) => set("warnChangePct", v)}
+                        autoComplete="off"
+                      />
+                    </InlineGrid>
+                    <InlineStack align="end" gap="200">
+                      <Button
+                        onClick={() => submit({ intent: "save", settings })}
+                        loading={busyIntent === "save"}
+                        disabled={busy}
+                      >
+                        Save settings
+                      </Button>
+                      <Button
+                        variant="primary"
+                        onClick={() => submit({ intent: "preview", settings })}
+                        loading={busyIntent === "preview"}
+                        disabled={busy}
+                      >
+                        Preview new prices
+                      </Button>
+                    </InlineStack>
+                  </BlockStack>
+                </Card>
+              </BlockStack>
+            </Layout.Section>
+
+            <Layout.Section variant="oneThird">
+              <BlockStack gap="400">
+                <Card>
+                  <BlockStack gap="300">
+                    <Text as="h2" variant="headingMd">
+                      Price formula
+                    </Text>
+                    <Box
+                      background="bg-surface-secondary"
+                      padding="300"
+                      borderRadius="200"
+                    >
+                      <BlockStack gap="100">
+                        <Text as="p" variant="bodySm" fontWeight="semibold">
+                          {activeFormulaOf(settings).name}
+                        </Text>
+                        <Text as="p" variant="bodySm">
+                          <code>{activeFormulaOf(settings).expression}</code>
+                        </Text>
+                        <Text as="p" variant="bodySm" tone="subdued">
+                          {settings.vat.enabled && data.taxesIncluded !== false
+                            ? `+ VAT ${settings.vat.pct}% on ${settings.vat.basis === "workmanship" ? "workmanship" : "the total"}, then rounded.`
+                            : "Then rounded. No VAT."}
+                        </Text>
+                      </BlockStack>
+                    </Box>
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      Karat price = 24k price × karat ÷ 24. 24k price = spot
+                      USD/oz ÷ 31.1035 × USD→{currency} × (1 + premium). Silver
+                      works the same way: 925 = 92.5% of the fine silver (999)
+                      price.
+                    </Text>
+                  </BlockStack>
+                </Card>
+
+                <Card>
+                  <BlockStack gap="300">
+                    <Text as="h2" variant="headingMd">
+                      History
+                    </Text>
+                    {runs.length === 0 ? (
+                      <Text as="p" tone="subdued">
+                        No price updates yet.
+                      </Text>
+                    ) : (
+                      <BlockStack gap="300">
+                        {runs.map((r) => (
+                          <InlineStack
+                            key={r.id}
+                            align="space-between"
+                            blockAlign="center"
+                            wrap={false}
+                            gap="200"
+                          >
+                            <BlockStack gap="050">
+                              <Text as="span" fontWeight="semibold">
+                                {r.kind === "undo" ? "Undo" : "Update"} ·{" "}
+                                {r.updatedCount} prices
+                              </Text>
+                              <Text as="span" variant="bodySm" tone="subdued">
+                                {formatDate(r.createdAt)}
+                                {r.gram24
+                                  ? ` · 24k ${money0.format(r.gram24)}`
+                                  : ""}
+                                {r.failedCount
+                                  ? ` · ${r.failedCount} failed`
+                                  : ""}
+                              </Text>
+                            </BlockStack>
+                            {r.undone ? (
+                              <Badge>Undone</Badge>
+                            ) : latestUndoable && latestUndoable.id === r.id ? (
+                              <Button
+                                size="slim"
+                                onClick={() =>
+                                  submit({ intent: "undo", runId: r.id })
+                                }
+                                loading={busyIntent === "undo"}
+                                disabled={busy}
+                              >
+                                Undo
+                              </Button>
+                            ) : null}
+                          </InlineStack>
+                        ))}
+                      </BlockStack>
+                    )}
+                  </BlockStack>
+                </Card>
+
+                <Card>
+                  <BlockStack gap="300">
+                    <Text as="h2" variant="headingMd">
+                      Market prices, last 14 days
+                    </Text>
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      Pure metal per gram in {currency}, before your premium.
+                    </Text>
+                    <RateHistory history={data.history} />
+                  </BlockStack>
+                </Card>
+
+                <Card>
+                  <BlockStack gap="300">
+                    <InlineStack align="space-between" blockAlign="center">
+                      <Text as="h2" variant="headingMd">
+                        How products are matched
+                      </Text>
+                      <Button
+                        variant="plain"
+                        onClick={() => setHelpOpen((o) => !o)}
+                      >
+                        {helpOpen ? "Hide" : "Show"}
+                      </Button>
+                    </InlineStack>
+                    <Collapsible open={helpOpen} id="gpe-help">
+                      <BlockStack gap="200">
+                        <Text as="p" variant="bodySm">
+                          <strong>Karat</strong>: metafield <code>karat</code>,
+                          then the title, tags, product type or SKU (e.g. “21k”,
+                          “21 karat”, “عيار 21”).
+                        </Text>
+                        <Text as="p" variant="bodySm">
+                          <strong>Silver</strong>: a product is silver when its{" "}
+                          <code>metal</code> metafield, title, tags, type or SKU
+                          says “silver”, “sterling” or “فضة”, or carries the 925
+                          hallmark. The purity (925 or 999) is read from the{" "}
+                          <code>purity</code> metafield, then the same places.
+                        </Text>
+                        <Text as="p" variant="bodySm">
+                          <strong>Origin</strong>: metafield <code>origin</code>
+                          , then title, tags or product type (“local”, “محلي”,
+                          “imported”, “مستورد”).
+                        </Text>
+                        <Text as="p" variant="bodySm">
+                          <strong>Weight (grams)</strong>, first match wins:
+                          metafield <code>metal_weight</code>, variant title
+                          (“5.5g”), SKU (the last number, e.g. GLD-21K-LOC-
+                          <strong>5.5</strong>), product title (“5 جرام”), tags,
+                          then the variant&apos;s shipping weight.
+                        </Text>
+                        <Text as="p" variant="bodySm" tone="subdued">
+                          For rings with different sizes, put each size&apos;s
+                          weight in its SKU or variant title rather than in the
+                          product metafield.
+                        </Text>
+                      </BlockStack>
+                    </Collapsible>
+                  </BlockStack>
+                </Card>
+              </BlockStack>
+            </Layout.Section>
+          </Layout>
+        </BlockStack>
+        <Box paddingBlockEnd="800" />
+      </Page>
+    </ShopContext.Provider>
   );
 }
 

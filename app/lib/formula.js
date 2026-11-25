@@ -8,15 +8,15 @@
 //
 // Pure module: runs in the browser (live example), on the server and in tests.
 
-/** The building blocks a formula can use, with their units. */
+/** The building blocks a formula can use, with their units ({currency} = the store currency). */
 export const VARIABLES = [
   {
     name: "metal_price",
     label: "Metal price",
-    unit: "EGP per gram (for the item's karat or purity)",
+    unit: "{currency} per gram (for the item's karat or purity)",
   },
   { name: "weight", label: "Weight", unit: "grams" },
-  { name: "making", label: "Making charge", unit: "EGP per gram" },
+  { name: "making", label: "Making charge", unit: "{currency} per gram" },
   {
     name: "making_pct",
     label: "Making charge %",
@@ -26,11 +26,11 @@ export const VARIABLES = [
   {
     name: "stone_cost",
     label: "Stone / diamond cost",
-    unit: "EGP total per piece",
+    unit: "{currency} total per piece",
   },
-  { name: "fixed_fee", label: "Fixed fee", unit: "EGP per piece" },
+  { name: "fixed_fee", label: "Fixed fee", unit: "{currency} per piece" },
   { name: "profit_pct", label: "Profit %", unit: "%" },
-  { name: "discount", label: "Discount", unit: "EGP per piece" },
+  { name: "discount", label: "Discount", unit: "{currency} per piece" },
 ];
 export const VARIABLE_NAMES = VARIABLES.map((v) => v.name);
 

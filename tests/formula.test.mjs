@@ -119,7 +119,7 @@ const product = (title, metafields = []) => ({
     { id: "gid://shopify/ProductVariant/1", title: "", sku: "", price: "1000" },
   ],
 });
-const live = { usdPerOunce: 3110.34768, usdEgp: 50 }; // 24k = 5,000 EGP/g
+const live = { usdPerOunce: 3110.34768, usdRate: 50 }; // 24k = 5,000 EGP/g
 
 test("plan: default settings give exactly today's prices", () => {
   const s = normalizeSettings({

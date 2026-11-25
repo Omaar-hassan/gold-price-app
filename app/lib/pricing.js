@@ -75,17 +75,21 @@ export const DEFAULT_SETTINGS = {
   premiumPct: 0,
   // Same for silver.
   silverPremiumPct: 0,
-  // Optional manual USD -> EGP rate. Empty = use the live rate.
+  // The store currency (Shopify's currencyCode) that all amounts below are in. Set by
+  // the server on every save, never chosen by the merchant. "" = never saved yet.
+  currency: "",
+  // Optional manual USD -> store currency rate (the key keeps its original name so
+  // saved settings still load). Empty = use the live rate.
   usdEgpOverride: "",
-  // Optional manual price per gram for a purity (EGP). Empty = derive from the live spot price.
+  // Optional manual price per gram for a purity (store currency). Empty = derive from the live spot price.
   karatOverrides: Object.fromEntries(PURITY_KEYS.map((k) => [k, ""])),
-  // Workmanship (making charge) in EGP per gram, by purity and origin.
+  // Workmanship (making charge) in store currency per gram, by purity and origin.
   making: Object.fromEntries(
     PURITY_KEYS.map((k) => [k, { local: 0, imported: 0 }]),
   ),
-  // Flat discount taken off each piece (EGP).
+  // Flat discount taken off each piece (store currency).
   discountPerPiece: 0,
-  // Round the final price to the nearest N EGP. "0.01" = no rounding.
+  // Round the final price to the nearest N (store currency). "0.01" = no rounding.
   rounding: "1",
   // Which purities to update.
   includeKarats: [...PURITY_KEYS],
@@ -104,7 +108,7 @@ export const DEFAULT_SETTINGS = {
   // Optional costs (shop-wide defaults; a product metafield can override them).
   wastagePct: 0, // % of the metal
   makingPct: 0, // % of the metal value
-  fixedFee: 0, // EGP per piece
+  fixedFee: 0, // store currency per piece
   profitPct: 0, // %
   // VAT is added after the formula. basis: "total" (whole price) or "workmanship".
   vat: { enabled: false, pct: 14, basis: "total" },
@@ -174,6 +178,9 @@ export function normalizeSettings(input = {}) {
     : DEFAULT_SETTINGS.includeKarats;
   const usd = input.usdEgpOverride;
   return {
+    currency: /^[A-Z]{3}$/.test(String(input.currency || ""))
+      ? String(input.currency)
+      : "",
     premiumPct: toNumber(s.premiumPct, 0),
     silverPremiumPct: toNumber(s.silverPremiumPct, 0),
     usdEgpOverride:
@@ -211,15 +218,15 @@ export function normalizeSettings(input = {}) {
 }
 
 /**
- * Price per gram in EGP for every purity.
- * live: { usdPerOunce, silverUsdPerOunce, usdEgp } from the price service (may be null if offline).
- * Returns { gram24, gramSilver, byKarat: { "21": { price, livePrice, source } }, usdEgp, usdPerOunce, silverUsdPerOunce }.
+ * Price per gram in the store currency for every purity.
+ * live: { usdPerOunce, silverUsdPerOunce, usdRate } from the price service (may be null if offline).
+ * Returns { gram24, gramSilver, byKarat: { "21": { price, livePrice, source } }, usdRate, usdPerOunce, silverUsdPerOunce }.
  * gram24 / gramSilver = price per gram of the pure metal, premium included.
  */
 export function karatPrices(live, settings) {
-  const usdEgp = settings.usdEgpOverride
+  const usdRate = settings.usdEgpOverride
     ? toNumber(settings.usdEgpOverride)
-    : toNumber(live?.usdEgp, 0);
+    : toNumber(live?.usdRate, 0);
   const spot = {
     gold: toNumber(live?.usdPerOunce, 0),
     silver: toNumber(live?.silverUsdPerOunce, 0),
@@ -231,8 +238,8 @@ export function karatPrices(live, settings) {
   const pureGram = {};
   for (const metal of Object.keys(METALS)) {
     pureGram[metal] =
-      spot[metal] > 0 && usdEgp > 0
-        ? (spot[metal] / TROY_OUNCE_GRAMS) * usdEgp * premium[metal]
+      spot[metal] > 0 && usdRate > 0
+        ? (spot[metal] / TROY_OUNCE_GRAMS) * usdRate * premium[metal]
         : 0;
   }
 
@@ -255,7 +262,7 @@ export function karatPrices(live, settings) {
     gram24: pureGram.gold,
     gramSilver: pureGram.silver,
     byKarat,
-    usdEgp,
+    usdRate,
     usdPerOunce: spot.gold,
     silverUsdPerOunce: spot.silver,
   };
