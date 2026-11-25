@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 import { json } from "@remix-run/node";
-import { useLoaderData, useRouteError } from "@remix-run/react";
+import { Link, useLoaderData, useRouteError } from "@remix-run/react";
 import {
   Badge,
   Banner,
@@ -34,6 +34,7 @@ import {
 } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { FriendlyError } from "../components/FriendlyError";
+import { shopFormat } from "../lib/format";
 import { authenticate } from "../shopify.server";
 import { getLiveGoldPrice, recentRates } from "../lib/goldPrice.server";
 import {
@@ -121,6 +122,11 @@ async function currencyProblem(admin, shop, shopInfo) {
 
 function rateProblem(currency, settings, live) {
   if (settings.usdEgpOverride || !live.fx.outdated) return null;
+  // Only matters if some purity being updated uses the live price (no manual price).
+  const usesLive = settings.includeKarats.some(
+    (k) => !(Number(settings.karatOverrides?.[k]) > 0),
+  );
+  if (!usesLive) return null;
   return live.usdRate
     ? `The USD → ${currency} exchange rate is out of date (last updated ${live.fx.updatedAt ? new Date(live.fx.updatedAt).toUTCString() : "unknown"}), so no prices were calculated. Try again later, or enter a manual exchange rate under Metal prices.`
     : `The USD → ${currency} exchange rate is unavailable (${live.fx.error || "unknown error"}), so no prices were calculated. Try again later, or enter a manual exchange rate under Metal prices.`;
@@ -304,50 +310,6 @@ export const action = async ({ request }) => {
 // ---------------------------------------------------------------------------
 // Formatting
 // ---------------------------------------------------------------------------
-
-// Money is always shown in the store's Shopify currency.
-function moneyFormat(currency, digits) {
-  const base = { style: "currency", currency, maximumFractionDigits: digits };
-  try {
-    return new Intl.NumberFormat("en-US", base);
-  } catch {
-    try {
-      // Currencies with more decimals by default (e.g. KWD) need a lower minimum.
-      return new Intl.NumberFormat("en-US", {
-        ...base,
-        minimumFractionDigits: 0,
-      });
-    } catch {
-      const n = new Intl.NumberFormat("en-US", {
-        maximumFractionDigits: digits,
-      });
-      return { format: (v) => `${currency} ${n.format(v)}` };
-    }
-  }
-}
-
-function shopFormat({ currency = "EGP", timeZone = "Africa/Cairo" } = {}) {
-  let tz = timeZone;
-  try {
-    new Intl.DateTimeFormat("en-GB", { timeZone: tz });
-  } catch {
-    tz = "UTC";
-  }
-  return {
-    currency,
-    money: moneyFormat(currency, 2),
-    money0: moneyFormat(currency, 0),
-    // Fixed (store) time zone so the server and the browser show the same time.
-    formatDate: (iso) =>
-      new Date(iso).toLocaleString("en-GB", {
-        timeZone: tz,
-        day: "numeric",
-        month: "short",
-        hour: "2-digit",
-        minute: "2-digit",
-      }),
-  };
-}
 
 const ShopContext = createContext(shopFormat());
 const useShop = () => useContext(ShopContext);
@@ -1211,7 +1173,12 @@ export default function Dashboard() {
   const currencyMismatch =
     data.shop.currencyKnown && savedCurrency && savedCurrency !== currency;
   const rateOutdated =
-    currency !== "USD" && live.fx.outdated && !settings.usdEgpOverride;
+    currency !== "USD" &&
+    live.fx.outdated &&
+    !settings.usdEgpOverride &&
+    settings.includeKarats.some(
+      (k) => !(Number(settings.karatOverrides?.[k]) > 0),
+    );
 
   return (
     <ShopContext.Provider value={shop}>
@@ -1435,7 +1402,17 @@ export default function Dashboard() {
                   </EmptyState>
                 )
               ) : (
-                <SkippedTable skipped={preview.skipped} />
+                <>
+                  {preview.skipped.length > 0 && (
+                    <Box padding="300">
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        Set the missing karat, origin or weight on the{" "}
+                        <Link to="/app/products">Products</Link> page.
+                      </Text>
+                    </Box>
+                  )}
+                  <SkippedTable skipped={preview.skipped} />
+                </>
               )}
             </Card>
           )}

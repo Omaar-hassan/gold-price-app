@@ -8,6 +8,7 @@ import {
   karatPrices,
   normalizeKarat,
   normalizeSettings,
+  productOverview,
   originFromText,
   silverPurityFromText,
   PURITIES,
@@ -304,4 +305,62 @@ test("prices follow the store currency rate (USD = 1, AED, manual rate wins)", (
   assert.equal(Math.round(manual.byKarat["24"].price * 1000) / 1000, 400);
   const noRate = karatPrices({ usdPerOunce: 3110.34768, usdRate: null }, s);
   assert.equal(noRate.byKarat["24"].price, 0);
+});
+
+test("products overview: ready, skipped with reason, and switched-off purities", () => {
+  const settings = normalizeSettings({
+    includeKarats: ["21"],
+    unknownOrigin: "local",
+  });
+  const prices = karatPrices(
+    { usdPerOunce: 3110.34768, usdRate: 50 },
+    settings,
+  );
+  const v = (id, title = "", extra = {}) => ({
+    id,
+    title,
+    price: "100",
+    sku: "",
+    weightGrams: 0,
+    ...extra,
+  });
+  const products = [
+    {
+      id: "p1",
+      title: "Ring 21K 5g",
+      tags: [],
+      metafields: [],
+      variants: [v("v1")],
+    },
+    { id: "p2", title: "Chain", tags: [], metafields: [], variants: [v("v2")] },
+    {
+      id: "p3",
+      title: "Bar 24K 10g",
+      tags: [],
+      metafields: [],
+      variants: [v("v3")],
+    },
+    {
+      id: "p4",
+      title: "Bangle",
+      tags: [],
+      metafields: [
+        { namespace: "custom", key: "karat", value: "18" },
+        { namespace: "gold_price", key: "karat", value: "21K" },
+      ],
+      variants: [v("v4", "", { fixWeight: "7.5" })],
+    },
+  ];
+  const o = productOverview(products, settings, prices, {});
+  const by = Object.fromEntries(o.items.map((i) => [i.variantId, i]));
+  assert.equal(by.v1.status, "ready");
+  assert.equal(by.v2.status, "skipped");
+  assert.equal(by.v2.reason, "Karat not found");
+  assert.equal(by.v3.status, "excluded");
+  // The Fix form's values win over other namespaces; variant weight is used.
+  assert.equal(by.v4.status, "ready");
+  assert.equal(by.v4.karat, "21");
+  assert.equal(by.v4.weight, 7.5);
+  assert.equal(by.v4.weightSource, "your fix");
+  assert.deepEqual(o.counts, { all: 4, ready: 2, skipped: 1, excluded: 1 });
 });
