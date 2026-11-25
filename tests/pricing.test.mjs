@@ -9,6 +9,8 @@ import {
   normalizeKarat,
   normalizeSettings,
   originFromText,
+  silverPurityFromText,
+  PURITIES,
   splitByCurrentPrice,
   weightFromMetafield,
   weightFromSku,
@@ -169,7 +171,7 @@ test("buildPlan prices, skips and flags", () => {
   assert.equal(rows[1].flagged, false);
   assert.deepEqual(
     skipped.map((s) => s.reason),
-    ["Origin not found", "Karat not found"],
+    ["Origin not found", "Silver purity not found"],
   );
 
   const assumeLocal = buildPlan(
@@ -208,4 +210,73 @@ test("only changes whose Shopify price is unchanged are safe to write", () => {
       ["v3", "Variant no longer exists"],
     ],
   );
+});
+
+test("silver purity detection", () => {
+  assert.equal(silverPurityFromText("925"), "S925");
+  assert.equal(silverPurityFromText("S925"), "S925");
+  assert.equal(silverPurityFromText("Sterling silver ring"), "S925");
+  assert.equal(silverPurityFromText("فضة 999"), "S999");
+  assert.equal(silverPurityFromText("SLV-999-12.5"), "S999");
+  assert.equal(silverPurityFromText("19250"), null);
+  assert.equal(silverPurityFromText("Silver ring"), null);
+});
+
+test("metal detection: silver vs gold", () => {
+  const d = (title, sku = "", metafields = [], tags = []) =>
+    detectVariant(
+      { title, tags, productType: "", metafields },
+      { title: "", sku },
+    );
+  // silver by word, by 925 hallmark, or by metafield
+  assert.deepEqual(
+    [
+      d("Sterling Silver Ring 5g Local").metal,
+      d("Sterling Silver Ring 5g Local").karat,
+    ],
+    ["silver", "S925"],
+  );
+  assert.equal(d("Chain 925 Local", "CH-925-10").karat, "S925");
+  assert.equal(
+    d("Bracelet", "", [
+      { key: "metal", value: "Silver" },
+      { key: "purity", value: "999" },
+    ]).karat,
+    "S999",
+  );
+  // 999 alone stays gold (fine gold is stamped 999 too); 21K stays gold
+  assert.equal(d("Bar 999 24K").metal, "gold");
+  assert.equal(d("Ring 21K").karat, "21");
+  assert.equal(d("Ring 9K Local").karat, "9");
+  assert.equal(d("Ring 10kt").karat, "10");
+});
+
+test("silver prices use the silver spot price and premium", () => {
+  const s = normalizeSettings({ silverPremiumPct: 10 });
+  // 31.1034768 USD/oz * 50 EGP = 50 EGP per gram of fine silver
+  const p = karatPrices(
+    { usdPerOunce: 3110.34768, silverUsdPerOunce: 31.1034768, usdEgp: 50 },
+    s,
+  );
+  assert.equal(Math.round(p.gramSilver * 100) / 100, 55);
+  assert.equal(Math.round(p.byKarat.S999.price * 100) / 100, 55);
+  assert.equal(Math.round(p.byKarat.S925.price * 100) / 100, 50.88);
+  // gold unaffected by the silver premium
+  assert.equal(Math.round(p.byKarat["24"].price), 5000);
+  // no silver spot -> no silver price, gold still works
+  const noSilver = karatPrices({ usdPerOunce: 3110.34768, usdEgp: 50 }, s);
+  assert.equal(noSilver.byKarat.S925.price, 0);
+});
+
+test("old saved settings keep working and new purities start switched off", () => {
+  const old = normalizeSettings({
+    includeKarats: ["21", "18"],
+    making: { 21: { local: 50 } },
+  });
+  assert.deepEqual(old.includeKarats, ["21", "18"]);
+  assert.equal(old.making["21"].local, 50);
+  assert.deepEqual(old.making.S925, { local: 0, imported: 0 });
+  assert.equal(old.karatOverrides["9"], "");
+  // every purity has a key, metal and fraction
+  for (const p of PURITIES) assert.ok(p.key && p.metal && p.fraction > 0);
 });
