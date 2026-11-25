@@ -6,6 +6,7 @@ import {
   parseFormula,
   vatAmount,
 } from "./formula.js";
+import { cleanTimes } from "./schedule.js";
 
 // Pure pricing helpers. Shared by the server (plan + apply) and the dashboard (live karat table).
 // Keep this file free of server-only imports so it can run in the browser and in unit tests.
@@ -112,6 +113,9 @@ export const DEFAULT_SETTINGS = {
   profitPct: 0, // %
   // VAT is added after the formula. basis: "total" (whole price) or "workmanship".
   vat: { enabled: false, pct: 14, basis: "total" },
+  // Automatic price updates at these "HH:MM" times (store time zone). Changes over
+  // warnChangePct are never applied automatically: they wait for the merchant.
+  auto: { enabled: false, times: ["10:00"] },
 };
 
 export const MAX_CUSTOM_FORMULAS = 20;
@@ -213,6 +217,12 @@ export function normalizeSettings(input = {}) {
       enabled: Boolean(input.vat?.enabled),
       pct: Math.max(0, Math.min(100, toNumber(input.vat?.pct, 14))),
       basis: input.vat?.basis === "workmanship" ? "workmanship" : "total",
+    },
+    auto: {
+      enabled: Boolean(input.auto?.enabled),
+      times: input.auto?.times
+        ? cleanTimes(input.auto.times)
+        : DEFAULT_SETTINGS.auto.times,
     },
   };
 }

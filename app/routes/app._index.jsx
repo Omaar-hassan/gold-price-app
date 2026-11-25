@@ -14,17 +14,20 @@ import {
 import { FriendlyError } from "../components/FriendlyError";
 import {
   AppPage,
+  AutoRunBanner,
   KaratCards,
   LiveHero,
   ShopAlerts,
   Sparkline,
   Stat,
+  runLabel,
   timeAgo,
   useLivePrice,
   useShop,
 } from "../components/ui";
 import { activeFormulaOf } from "../components/pricing";
 import { loadContext } from "../lib/pages.server";
+import { autoSummary } from "../lib/auto.server";
 import { recentRates } from "../lib/goldPrice.server";
 import { fetchAllProducts, recentRuns } from "../lib/store.server";
 import { karatPrices, productOverview } from "../lib/pricing";
@@ -33,9 +36,10 @@ export const meta = () => [{ title: "Gold Price Editor" }];
 
 export const loader = async ({ request }) => {
   const ctx = await loadContext(request);
-  const [runs, history, totals] = await Promise.all([
+  const [runs, history, auto, totals] = await Promise.all([
     recentRuns(ctx.shopDomain, 5),
     recentRates(14, ctx.currency),
+    autoSummary(ctx.shopDomain, ctx.settings, ctx.shopInfo.timeZone),
     // Real product totals. If Shopify can't be read, the dashboard still loads.
     fetchAllProducts(ctx.admin)
       .then((products) => {
@@ -58,7 +62,7 @@ export const loader = async ({ request }) => {
         return null;
       }),
   ]);
-  return json({ ...ctx.common, runs, history, totals });
+  return json({ ...ctx.common, runs, history, auto, totals });
 };
 
 function pctChange(history) {
@@ -89,7 +93,8 @@ function RecentUpdates({ runs, now }) {
         >
           <BlockStack gap="050">
             <Text as="span" fontWeight="semibold">
-              {r.kind === "undo" ? "Undo" : "Update"} · {r.updatedCount} prices
+              {runLabel(r.kind)} · {r.updatedCount} price
+              {r.updatedCount === 1 ? "" : "s"}
             </Text>
             <Text as="span" variant="bodySm" tone="subdued">
               {formatDate(r.createdAt)} · {timeAgo(r.createdAt, now)}
@@ -106,12 +111,65 @@ function RecentUpdates({ runs, now }) {
   );
 }
 
+const AUTO_STATUS = {
+  running: { label: "Running", tone: "info" },
+  applied: { label: "Done", tone: "success" },
+  held: { label: "Waiting for you", tone: "warning" },
+  skipped: { label: "Skipped", tone: "critical" },
+  failed: { label: "Problem", tone: "critical" },
+};
+
+function AutoCard({ auto }) {
+  const { formatDate } = useShop();
+  const latest = auto.latest;
+  const status = latest && AUTO_STATUS[latest.status];
+  return (
+    <Card>
+      <BlockStack gap="300">
+        <InlineStack align="space-between" blockAlign="center">
+          <Text as="h2" variant="headingMd">
+            Automatic updates
+          </Text>
+          <Badge tone={auto.enabled ? "success" : undefined}>
+            {auto.enabled ? "On" : "Off"}
+          </Badge>
+        </InlineStack>
+        {auto.enabled ? (
+          <Text as="p" variant="bodySm">
+            {auto.next
+              ? `Next update: ${formatDate(auto.next)}`
+              : "No times set."}
+          </Text>
+        ) : (
+          <Text as="p" variant="bodySm" tone="subdued">
+            Prices change only when you press Apply.
+          </Text>
+        )}
+        {latest && (
+          <InlineStack align="space-between" blockAlign="center" gap="200">
+            <Text as="span" variant="bodySm" tone="subdued">
+              Last: {formatDate(latest.slot)}
+              {latest.updatedCount
+                ? ` · ${latest.updatedCount} price${latest.updatedCount === 1 ? "" : "s"}`
+                : ""}
+            </Text>
+            {status && <Badge tone={status.tone}>{status.label}</Badge>}
+          </InlineStack>
+        )}
+        <Link to="/app/settings">
+          {auto.enabled ? "Change times" : "Turn on in Settings"}
+        </Link>
+      </BlockStack>
+    </Card>
+  );
+}
+
 export default function Dashboard() {
   const data = useLoaderData();
   const { settings, totals, runs } = data;
   const { live, refresh, refreshing, now, trend } = useLivePrice(data.live);
   const prices = useMemo(() => karatPrices(live, settings), [live, settings]);
-  const lastRun = runs.find((r) => r.kind === "apply");
+  const lastRun = runs.find((r) => r.kind === "apply" || r.kind === "auto");
   const change = pctChange(data.history);
   const formula = activeFormulaOf(settings);
 
@@ -132,6 +190,11 @@ export default function Dashboard() {
           refreshing={refreshing}
         />
         <ShopAlerts live={live} settings={settings} shop={data.shop} />
+        <AutoRunBanner
+          autoRun={data.auto.latest}
+          lastManualAt={data.auto.lastManualAt}
+          reviewAction={{ content: "Go to Price Updates", url: "/app/updates" }}
+        />
 
         <InlineGrid columns={{ xs: 2, md: 4 }} gap="300">
           <Link to="/app/products" className="gpe-stat-link">
@@ -156,7 +219,11 @@ export default function Dashboard() {
           <Link to="/app/history" className="gpe-stat-link">
             <Stat
               label="Last update"
-              value={lastRun ? `${lastRun.updatedCount} prices` : "Never"}
+              value={
+                lastRun
+                  ? `${lastRun.updatedCount} price${lastRun.updatedCount === 1 ? "" : "s"}`
+                  : "Never"
+              }
               help={
                 lastRun
                   ? `${timeAgo(lastRun.createdAt, now)}${lastRun.undone ? " · undone" : ""}`
@@ -227,6 +294,7 @@ export default function Dashboard() {
           </Layout.Section>
           <Layout.Section variant="oneThird">
             <BlockStack gap="400">
+              <AutoCard auto={data.auto} />
               <Card>
                 <BlockStack gap="300">
                   <InlineStack align="space-between" blockAlign="center">

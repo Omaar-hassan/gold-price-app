@@ -734,3 +734,42 @@ export function SkippedTable({ skipped }) {
     </IndexTable>
   );
 }
+
+export const runLabel = (kind) =>
+  kind === "undo" ? "Undo" : kind === "auto" ? "Automatic update" : "Update";
+
+/**
+ * Tells the merchant when the latest automatic update needs them: big changes held
+ * for review, or a run that was skipped or failed. Hidden once a later manual update
+ * has run. reviewAction: Banner action (omit on the Price Updates page itself).
+ */
+export function AutoRunBanner({ autoRun, lastManualAt, reviewAction }) {
+  const { formatDate } = useShop();
+  if (!autoRun || !["held", "skipped", "failed"].includes(autoRun.status))
+    return null;
+  if (lastManualAt && lastManualAt > autoRun.slot) return null;
+  const when = formatDate(autoRun.slot);
+  const title =
+    autoRun.status === "held"
+      ? `${autoRun.heldCount} big price change${autoRun.heldCount === 1 ? " is" : "s are"} waiting for you`
+      : autoRun.status === "skipped"
+        ? "The last automatic update was skipped"
+        : "The last automatic update had problems";
+  return (
+    <Banner
+      tone={autoRun.status === "held" ? "warning" : "critical"}
+      title={title}
+      action={reviewAction}
+    >
+      <p>
+        Automatic update at {when}
+        {autoRun.updatedCount
+          ? `: ${autoRun.updatedCount} price${autoRun.updatedCount === 1 ? "" : "s"} updated. `
+          : ". "}
+        {autoRun.status === "held"
+          ? "Press Preview new prices on Price Updates, check the highlighted rows, then apply the ones you want."
+          : autoRun.message}
+      </p>
+    </Banner>
+  );
+}

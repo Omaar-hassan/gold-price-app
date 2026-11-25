@@ -94,3 +94,21 @@ model MetalRate {
   @@unique([metal, day, currency])
   @@index([day])
 }
+
+// One row per scheduled automatic update (store + scheduled time). The unique key makes
+// sure each scheduled time runs once, even if the timer calls twice.
+// status: running | applied | held | stopped | skipped | failed.
+model AutoRun {
+  id           Int      @id @default(autoincrement())
+  shop         String
+  slot         DateTime
+  createdAt    DateTime @default(now())
+  status       String   @default("running")
+  message      String?
+  updatedCount Int      @default(0)
+  heldCount    Int      @default(0)
+  runId        Int?
+
+  @@unique([shop, slot])
+  @@index([shop, createdAt])
+}
