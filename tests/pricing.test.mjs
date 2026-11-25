@@ -127,7 +127,10 @@ test("buildPlan prices, skips and flags", () => {
     rounding: "1",
     warnChangePct: 20,
   });
-  const prices = karatPrices({ usdPerOunce: 3110.34768, usdRate: 50 }, settings);
+  const prices = karatPrices(
+    { usdPerOunce: 3110.34768, usdRate: 50 },
+    settings,
+  );
   const products = [
     {
       id: "gid://shopify/Product/1",
