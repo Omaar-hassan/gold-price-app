@@ -31,7 +31,7 @@ import { activeFormulaOf } from "../components/pricing";
 import { loadContext } from "../lib/pages.server";
 import { autoSummary } from "../lib/auto.server";
 import { recentRates } from "../lib/goldPrice.server";
-import { fetchAllProducts, recentRuns } from "../lib/store.server";
+import { recentRuns } from "../lib/store.server";
 import { karatPrices, productOverview } from "../lib/pricing";
 
 export const meta = () => [{ title: "Gold Price Editor" }];
@@ -43,7 +43,8 @@ export const loader = async ({ request }) => {
     recentRates(14, ctx.currency),
     autoSummary(ctx.shopDomain, ctx.settings, ctx.shopInfo.timeZone),
     // Real product totals. If Shopify can't be read, the dashboard still loads.
-    fetchAllProducts(ctx.admin)
+    ctx.store
+      .listProducts()
       .then((products) => {
         const prices = karatPrices(ctx.live, ctx.settings);
         const o = productOverview(products, ctx.settings, prices, {

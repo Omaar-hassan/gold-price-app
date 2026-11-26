@@ -13,14 +13,8 @@ import { getLiveGoldPrice, rateJumps } from "./goldPrice.server";
 import { currencyProblem, rateProblem } from "./pages.server";
 import { buildPlan, karatPrices, PURITY_BY_KEY, toNumber } from "./pricing";
 import { dueSlot, nextSlot } from "./schedule";
-import {
-  applyPrices,
-  fetchAllProducts,
-  fetchShopInfo,
-  loadSettings,
-  logActivity,
-  recordRun,
-} from "./store.server";
+import { shopifyConnector } from "./connectors/shopify.server";
+import { loadSettings, logActivity, recordRun } from "./store.server";
 
 let running = false;
 
@@ -59,7 +53,7 @@ function livePriceProblem(rows, settings, live) {
  * The plan is worked out from the prices in Shopify right now, so a price edited by
  * hand is simply the new starting point.
  */
-export async function runShop(shop, admin, settings, shopInfo) {
+export async function runShop(shop, admin, store, settings, shopInfo) {
   const blocked = await currencyProblem(admin, shop, shopInfo);
   if (blocked) return { status: "skipped", message: blocked };
   const live = await getLiveGoldPrice(shopInfo.currency);
@@ -67,7 +61,7 @@ export async function runShop(shop, admin, settings, shopInfo) {
   if (rateBlocked) return { status: "skipped", message: rateBlocked };
 
   const prices = karatPrices(live, settings);
-  const products = await fetchAllProducts(admin);
+  const products = await store.listProducts();
   const plan = buildPlan(products, settings, prices, {
     taxesIncluded: shopInfo.taxesIncluded,
   });
@@ -102,7 +96,7 @@ export async function runShop(shop, admin, settings, shopInfo) {
   const toApply = changes.filter((r) => !r.flagged);
 
   const result = toApply.length
-    ? await applyPrices(admin, toApply)
+    ? await store.setPrices(toApply)
     : { updated: [], errors: [] };
   let runId = null;
   if (result.updated.length || result.errors.length) {
@@ -178,7 +172,8 @@ async function runOne(shop, now) {
   }
   const settings = await loadSettings(admin, shop);
   if (!settings.auto.enabled) return;
-  const shopInfo = await fetchShopInfo(admin, shop);
+  const store = shopifyConnector(admin, shop);
+  const shopInfo = await store.getStoreInfo();
   const slot = dueSlot(settings.auto.times, shopInfo.timeZone || "UTC", now);
   if (!slot) return;
 
@@ -195,7 +190,7 @@ async function runOne(shop, now) {
 
   let outcome;
   try {
-    outcome = await runShop(shop, admin, settings, shopInfo);
+    outcome = await runShop(shop, admin, store, settings, shopInfo);
   } catch (error) {
     console.error(`[gold-price] automatic update failed for ${shop}:`, error);
     outcome = {
