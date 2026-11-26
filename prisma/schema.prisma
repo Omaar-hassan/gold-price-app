@@ -112,3 +112,10 @@ model AutoRun {
   @@unique([shop, slot])
   @@index([shop, createdAt])
 }
+
+// Small app-wide values, e.g. when the outside timer last called /api/auto-run.
+model AppState {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}

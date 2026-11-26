@@ -773,3 +773,37 @@ export function AutoRunBanner({ autoRun, lastManualAt, reviewAction }) {
     </Banner>
   );
 }
+
+const AUTO_STATUS = {
+  running: { label: "Running", tone: "info" },
+  applied: { label: "Done", tone: "success" },
+  held: { label: "Waiting for you", tone: "warning" },
+  skipped: { label: "Skipped", tone: "critical" },
+  failed: { label: "Problem", tone: "critical" },
+};
+
+/** Badge label and tone for an automatic run. */
+export function autoStatus(run) {
+  if (run.status === "applied" && !run.updatedCount)
+    return { label: "No changes", tone: undefined };
+  return AUTO_STATUS[run.status] || { label: run.status, tone: undefined };
+}
+
+/** When the outside timer last called the app, so the merchant can see it works. */
+export function TimerLine({ auto }) {
+  const { formatDate } = useShop();
+  return (
+    <Text
+      as="p"
+      variant="bodySm"
+      tone={auto.timerStale ? "caution" : "subdued"}
+    >
+      {auto.timerAt
+        ? `Timer last checked in: ${formatDate(auto.timerAt)}`
+        : "The timer hasn't checked in yet."}
+      {auto.timerStale && auto.timerAt
+        ? " That was over 30 minutes ago, so check your timer job."
+        : ""}
+    </Text>
+  );
+}

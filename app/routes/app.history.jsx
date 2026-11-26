@@ -14,6 +14,7 @@ import {
 import { FriendlyError } from "../components/FriendlyError";
 import {
   AppPage,
+  autoStatus,
   NoticeBanner,
   runLabel,
   usePageAction,
@@ -21,6 +22,7 @@ import {
 } from "../components/ui";
 import { loadContext, pageAction } from "../lib/pages.server";
 import { getRun, recentRuns } from "../lib/store.server";
+import { recentAutoRuns } from "../lib/auto.server";
 
 export const meta = () => [{ title: "History · Gold Price Editor" }];
 export const shouldRevalidate = ({ formMethod, defaultShouldRevalidate }) =>
@@ -28,7 +30,10 @@ export const shouldRevalidate = ({ formMethod, defaultShouldRevalidate }) =>
 
 export const loader = async ({ request }) => {
   const ctx = await loadContext(request);
-  const runs = await recentRuns(ctx.shopDomain, 50);
+  const [runs, autoRuns] = await Promise.all([
+    recentRuns(ctx.shopDomain, 50),
+    recentAutoRuns(ctx.shopDomain, 20),
+  ]);
   // Details of one run, when ?run=<id> is in the URL.
   const runId = Number(new URL(request.url).searchParams.get("run"));
   let detail = null;
@@ -44,7 +49,7 @@ export const loader = async ({ request }) => {
       detail = { id: run.id, kind: run.kind, changes };
     }
   }
-  return json({ shop: ctx.common.shop, runs, detail });
+  return json({ shop: ctx.common.shop, runs, autoRuns, detail });
 };
 export const action = pageAction;
 
@@ -167,8 +172,50 @@ export default function History() {
           busyIntent={busyIntent}
           onUndo={(id) => submit({ intent: "undo", runId: id })}
         />
+        {data.autoRuns.length > 0 && <AutoChecks autoRuns={data.autoRuns} />}
       </BlockStack>
     </AppPage>
+  );
+}
+
+// Every automatic check, including ones that changed nothing or were skipped (those
+// have no row in the table above, because no price changed).
+function AutoChecks({ autoRuns }) {
+  const { formatDate } = useShop();
+  return (
+    <Card>
+      <BlockStack gap="300">
+        <BlockStack gap="050">
+          <Text as="h2" variant="headingMd">
+            Automatic checks
+          </Text>
+          <Text as="p" variant="bodySm" tone="subdued">
+            Each scheduled time, including the ones that changed nothing.
+          </Text>
+        </BlockStack>
+        {autoRuns.map((r) => {
+          const status = autoStatus(r);
+          return (
+            <BlockStack key={r.id} gap="050">
+              <InlineStack align="space-between" blockAlign="center" gap="200">
+                <Text as="span" fontWeight="semibold">
+                  {formatDate(r.slot)}
+                  {r.updatedCount
+                    ? ` · ${r.updatedCount} price${r.updatedCount === 1 ? "" : "s"} updated`
+                    : ""}
+                </Text>
+                <Badge tone={status.tone}>{status.label}</Badge>
+              </InlineStack>
+              {r.message && (
+                <Text as="p" variant="bodySm" tone="subdued">
+                  {r.message}
+                </Text>
+              )}
+            </BlockStack>
+          );
+        })}
+      </BlockStack>
+    </Card>
   );
 }
 

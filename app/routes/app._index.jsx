@@ -15,6 +15,7 @@ import { FriendlyError } from "../components/FriendlyError";
 import {
   AppPage,
   AutoRunBanner,
+  autoStatus,
   KaratCards,
   LiveHero,
   ShopAlerts,
@@ -22,6 +23,7 @@ import {
   Stat,
   runLabel,
   timeAgo,
+  TimerLine,
   useLivePrice,
   useShop,
 } from "../components/ui";
@@ -111,18 +113,10 @@ function RecentUpdates({ runs, now }) {
   );
 }
 
-const AUTO_STATUS = {
-  running: { label: "Running", tone: "info" },
-  applied: { label: "Done", tone: "success" },
-  held: { label: "Waiting for you", tone: "warning" },
-  skipped: { label: "Skipped", tone: "critical" },
-  failed: { label: "Problem", tone: "critical" },
-};
-
 function AutoCard({ auto }) {
   const { formatDate } = useShop();
   const latest = auto.latest;
-  const status = latest && AUTO_STATUS[latest.status];
+  const status = latest && autoStatus(latest);
   return (
     <Card>
       <BlockStack gap="300">
@@ -156,6 +150,7 @@ function AutoCard({ auto }) {
             {status && <Badge tone={status.tone}>{status.label}</Badge>}
           </InlineStack>
         )}
+        {auto.enabled && <TimerLine auto={auto} />}
         <Link to="/app/settings">
           {auto.enabled ? "Change times" : "Turn on in Settings"}
         </Link>
