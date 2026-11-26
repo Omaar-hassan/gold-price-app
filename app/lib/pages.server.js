@@ -4,12 +4,9 @@
 import { json } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
 import { getLiveGoldPrice, rateJumps } from "./goldPrice.server";
+import { shopifyConnector } from "./connectors/shopify.server";
 import {
-  applyPrices,
   claimPreview,
-  fetchAllProducts,
-  fetchShopInfo,
-  fetchVariantPrices,
   getRun,
   loadSettings,
   logActivity,
@@ -29,14 +26,16 @@ import { buildPlan, karatPrices, PURITY_BY_KEY, toNumber } from "./pricing";
  */
 export async function loadContext(request) {
   const { admin, session } = await authenticate.admin(request);
+  const store = shopifyConnector(admin, session.shop);
   const [shopInfo, settings] = await Promise.all([
-    fetchShopInfo(admin, session.shop),
+    store.getStoreInfo(),
     loadSettings(admin, session.shop),
   ]);
   const currency = shopInfo.currency || settings.currency || "USD";
   const live = await getLiveGoldPrice(currency);
   return {
     admin,
+    store,
     shopDomain: session.shop,
     shopInfo,
     settings,
@@ -126,6 +125,7 @@ function changedSettings(before, after) {
 export async function pageAction({ request }) {
   const { admin, session, sessionToken } = await authenticate.admin(request);
   const shop = session.shop;
+  const store = shopifyConnector(admin, shop);
   const actor = actorOf(sessionToken);
   let body;
   try {
@@ -155,13 +155,13 @@ export async function pageAction({ request }) {
 
   try {
     if (body.intent === "save") {
-      const shopInfo = await fetchShopInfo(admin, shop);
+      const shopInfo = await store.getStoreInfo();
       const settings = await savePatch(shopInfo);
       return json({ intent: "save", ok: true, settings });
     }
 
     if (body.intent === "preview") {
-      const shopInfo = await fetchShopInfo(admin, shop);
+      const shopInfo = await store.getStoreInfo();
       const blocked = await currencyProblem(admin, shop, shopInfo);
       if (blocked)
         return json({ intent: "preview", error: blocked }, { status: 409 });
@@ -184,7 +184,7 @@ export async function pageAction({ request }) {
           { status: 503 },
         );
       }
-      const products = await fetchAllProducts(admin);
+      const products = await store.listProducts();
       const { taxesIncluded } = shopInfo;
       const images = Object.fromEntries(products.map((p) => [p.id, p.image]));
       const plan = buildPlan(products, settings, prices, { taxesIncluded });
@@ -252,10 +252,7 @@ export async function pageAction({ request }) {
         (r) => wanted.has(r.variantId) && toNumber(r.newPrice, 0) > 0,
       );
       // Skip variants whose price was edited in Shopify after the preview.
-      const current = await fetchVariantPrices(
-        admin,
-        changes.map((c) => c.variantId),
-      );
+      const current = await store.getPrices(changes.map((c) => c.variantId));
       const { safe, skipped } = splitByCurrentPrice(
         changes,
         current,
@@ -263,7 +260,7 @@ export async function pageAction({ request }) {
       );
 
       const result = safe.length
-        ? await applyPrices(admin, safe)
+        ? await store.setPrices(safe)
         : { updated: [], errors: [] };
       if (result.updated.length || result.errors.length) {
         await logActivity(
@@ -309,17 +306,14 @@ export async function pageAction({ request }) {
         .map((c) => ({ ...c, currentPrice: c.newPrice, newPrice: c.oldPrice }));
       // Only restore prices that are still what this run set. A price edited by hand
       // afterwards is left alone and reported.
-      const current = await fetchVariantPrices(
-        admin,
-        changes.map((c) => c.variantId),
-      );
+      const current = await store.getPrices(changes.map((c) => c.variantId));
       const { safe, skipped } = splitByCurrentPrice(
         changes,
         current,
         "currentPrice",
       );
       const result = safe.length
-        ? await applyPrices(admin, safe)
+        ? await store.setPrices(safe)
         : { updated: [], errors: [] };
       if (result.updated.length || result.errors.length) {
         await recordRun(shop, { kind: "undo", ...result });

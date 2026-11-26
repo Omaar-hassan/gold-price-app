@@ -22,13 +22,7 @@ import { TitleBar } from "@shopify/app-bridge-react";
 import { FriendlyError } from "../components/FriendlyError";
 import { authenticate } from "../shopify.server";
 import { getLiveGoldPrice } from "../lib/goldPrice.server";
-import {
-  fetchAllProducts,
-  fetchShopInfo,
-  loadSettings,
-  logActivity,
-  saveProductFix,
-} from "../lib/store.server";
+import { loadSettings, logActivity } from "../lib/store.server";
 import {
   ORIGIN_LABELS,
   PURITIES,
@@ -39,6 +33,7 @@ import {
 } from "../lib/pricing";
 import { shopFormat } from "../lib/format";
 import { actorOf } from "../lib/pages.server";
+import { shopifyConnector } from "../lib/connectors/shopify.server";
 
 export const meta = () => [{ title: "Products · Gold Price Editor" }];
 
@@ -46,10 +41,11 @@ export const meta = () => [{ title: "Products · Gold Price Editor" }];
 // be priced. It never changes prices; that stays Preview -> Apply on the dashboard.
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
+  const store = shopifyConnector(admin, session.shop);
   const [shopInfo, settings, products] = await Promise.all([
-    fetchShopInfo(admin, session.shop),
+    store.getStoreInfo(),
     loadSettings(admin, session.shop),
-    fetchAllProducts(admin),
+    store.listProducts(),
   ]);
   const currency = shopInfo.currency || settings.currency || "USD";
   const live = await getLiveGoldPrice(currency);
@@ -105,7 +101,11 @@ export const action = async ({ request }) => {
     return json({ error: "Nothing to save." }, { status: 400 });
 
   try {
-    await saveProductFix(admin, body.productId, body.variantId, fix);
+    await shopifyConnector(admin, session.shop).saveProductFix(
+      body.productId,
+      body.variantId,
+      fix,
+    );
     await logActivity(
       session.shop,
       actorOf(sessionToken),

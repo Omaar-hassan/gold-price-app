@@ -29,9 +29,8 @@ import {
 } from "../components/ui";
 import { actorOf, loadContext } from "../lib/pages.server";
 import { authenticate } from "../shopify.server";
+import { shopifyConnector } from "../lib/connectors/shopify.server";
 import {
-  applyPrices,
-  fetchVariantPrices,
   getPriceChange,
   logActivity,
   recordRun,
@@ -49,7 +48,7 @@ export const loader = async ({ request }) => {
     return json({ shop: ctx.common.shop, variantId: null, history: [] });
   const [history, current] = await Promise.all([
     variantHistory(ctx.shopDomain, variantId),
-    fetchVariantPrices(ctx.admin, [variantId]).catch(() => new Map()),
+    ctx.store.getPrices([variantId]).catch(() => new Map()),
   ]);
   return json({
     shop: ctx.common.shop,
@@ -62,6 +61,7 @@ export const loader = async ({ request }) => {
 export const action = async ({ request }) => {
   const { admin, session, sessionToken } = await authenticate.admin(request);
   const shop = session.shop;
+  const store = shopifyConnector(admin, shop);
   let body;
   try {
     body = await request.json();
@@ -80,7 +80,7 @@ export const action = async ({ request }) => {
     return json({ error: "That price can't be restored." }, { status: 400 });
 
   try {
-    const current = await fetchVariantPrices(admin, [change.variantId]);
+    const current = await store.getPrices([change.variantId]);
     if (!current.has(change.variantId))
       return json(
         { error: "This variant no longer exists in Shopify." },
@@ -97,7 +97,7 @@ export const action = async ({ request }) => {
       currentPrice,
       newPrice: price,
     };
-    const result = await applyPrices(admin, [item]);
+    const result = await store.setPrices([item]);
     if (result.errors.length)
       return json(
         { error: `Shopify did not save it: ${result.errors[0].message}` },
