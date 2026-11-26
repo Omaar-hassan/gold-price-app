@@ -57,7 +57,7 @@ export async function loadContext(request) {
 
 // Why a preview can't run, or null. Each reason is a clear message instead of
 // pricing with a wrong currency or an old exchange rate.
-async function currencyProblem(admin, shop, shopInfo) {
+export async function currencyProblem(admin, shop, shopInfo) {
   if (!shopInfo.currency)
     return "We couldn't read your store currency from Shopify, so no prices were calculated. Please try again in a minute.";
   const stored = await loadSettings(admin, shop);
@@ -66,7 +66,7 @@ async function currencyProblem(admin, shop, shopInfo) {
   return null;
 }
 
-function rateProblem(currency, settings, live) {
+export function rateProblem(currency, settings, live) {
   if (settings.usdEgpOverride || !live.fx.outdated) return null;
   // Only matters if some purity being updated uses the live price (no manual price).
   const usesLive = settings.includeKarats.some(
@@ -222,7 +222,7 @@ export async function pageAction({ request }) {
 
     if (body.intent === "undo") {
       const run = await getRun(shop, Number(body.runId));
-      if (!run || run.undone || run.kind !== "apply") {
+      if (!run || run.undone || !["apply", "auto"].includes(run.kind)) {
         return json(
           { intent: "undo", error: "This run can't be undone." },
           { status: 400 },

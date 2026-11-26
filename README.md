@@ -17,6 +17,19 @@ The app uses PostgreSQL ([Neon](https://neon.tech) in production) through Prisma
 - Local development: put `DATABASE_URL=...` in a `.env` file (never commit it). A separate Neon branch, or a local PostgreSQL, keeps test data away from production.
 - Pricing settings are also stored in a Shopify shop metafield, so they survive a database reset.
 
+## Automatic price updates
+
+Merchants switch these on in **Settings → Automatic updates** and pick up to 4 times a day (store time zone). Render's free plan sleeps, so an outside timer calls the app:
+
+1. Make a long random secret (at least 16 characters) and add it on Render under **Environment** as `CRON_SECRET`. Never put it in code or chat.
+2. On a free timer service such as [cron-job.org](https://cron-job.org), create a job:
+   - URL: `https://<your-app>.onrender.com/api/auto-run`
+   - Schedule: every 10 minutes
+   - Advanced → Headers: `Authorization` = `Bearer <CRON_SECRET>`
+3. The endpoint answers `202` at once and runs every store whose time is due. Each time runs once per store. A missed time is still run up to 3 hours late; older ones are skipped.
+
+Safety: a run is skipped when the live price or exchange rate is unavailable or out of date. Changes bigger than the store's warning % are never applied automatically; they wait on Price Updates. Every automatic run appears in History and can be undone.
+
 ---
 
 # Shopify App Template - Remix

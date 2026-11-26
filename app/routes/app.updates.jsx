@@ -16,6 +16,7 @@ import {
 import { FriendlyError } from "../components/FriendlyError";
 import {
   AppPage,
+  AutoRunBanner,
   KaratCards,
   NoticeBanner,
   PreviewTable,
@@ -27,6 +28,7 @@ import {
 } from "../components/ui";
 import { activeFormulaOf } from "../components/pricing";
 import { loadContext, pageAction } from "../lib/pages.server";
+import { autoSummary } from "../lib/auto.server";
 import { karatPrices } from "../lib/pricing";
 
 export const meta = () => [{ title: "Price Updates · Gold Price Editor" }];
@@ -35,7 +37,12 @@ export const shouldRevalidate = ({ formMethod, defaultShouldRevalidate }) =>
 
 export const loader = async ({ request }) => {
   const ctx = await loadContext(request);
-  return json(ctx.common);
+  const auto = await autoSummary(
+    ctx.shopDomain,
+    ctx.settings,
+    ctx.shopInfo.timeZone,
+  );
+  return json({ ...ctx.common, auto });
 };
 export const action = pageAction;
 
@@ -236,6 +243,12 @@ export default function PriceUpdates() {
       <BlockStack gap="400">
         <ShopAlerts live={live} settings={settings} shop={data.shop} />
         <NoticeBanner notice={notice} onDismiss={() => setNotice(null)} />
+        {!preview && (
+          <AutoRunBanner
+            autoRun={data.auto.latest}
+            lastManualAt={data.auto.lastManualAt}
+          />
+        )}
 
         {preview ? (
           <PreviewCard

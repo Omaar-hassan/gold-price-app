@@ -15,6 +15,7 @@ import { FriendlyError } from "../components/FriendlyError";
 import {
   AppPage,
   NoticeBanner,
+  runLabel,
   usePageAction,
   useShop,
 } from "../components/ui";
@@ -54,8 +55,7 @@ function RunDetail({ detail }) {
       <Box padding="400">
         <InlineStack align="space-between" blockAlign="center">
           <Text as="h2" variant="headingMd">
-            {detail.kind === "undo" ? "Undo" : "Update"} #{detail.id}:{" "}
-            {detail.changes.length} price
+            {runLabel(detail.kind)} #{detail.id}: {detail.changes.length} price
             {detail.changes.length === 1 ? "" : "s"}
           </Text>
           <Link to="/app/history">Close</Link>
@@ -145,7 +145,10 @@ export default function History() {
   );
   // Only the most recent update can be undone (older ones may have been overwritten).
   const latestUndoable = runs.find(
-    (r) => r.kind === "apply" && !r.undone && r.updatedCount > 0,
+    (r) =>
+      (r.kind === "apply" || r.kind === "auto") &&
+      !r.undone &&
+      r.updatedCount > 0,
   );
 
   return (
@@ -204,8 +207,16 @@ function HistoryTable({ runs, latestUndoable, busy, busyIntent, onUndo }) {
             <IndexTable.Cell>{formatDate(r.createdAt)}</IndexTable.Cell>
             <IndexTable.Cell>
               <InlineStack gap="100">
-                <Badge tone={r.kind === "undo" ? "info" : undefined}>
-                  {r.kind === "undo" ? "Undo" : "Update"}
+                <Badge
+                  tone={
+                    r.kind === "undo"
+                      ? "info"
+                      : r.kind === "auto"
+                        ? "success"
+                        : undefined
+                  }
+                >
+                  {r.kind === "auto" ? "Automatic" : runLabel(r.kind)}
                 </Badge>
                 {r.undone && <Badge>Undone</Badge>}
                 {r.failedCount > 0 && (

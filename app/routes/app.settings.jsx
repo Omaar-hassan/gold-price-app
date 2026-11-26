@@ -3,6 +3,7 @@ import { useLoaderData, useRouteError } from "@remix-run/react";
 import {
   Badge,
   BlockStack,
+  Button,
   Card,
   Checkbox,
   InlineGrid,
@@ -29,11 +30,96 @@ export const shouldRevalidate = ({ formMethod, defaultShouldRevalidate }) =>
 
 export const loader = async ({ request }) => {
   const ctx = await loadContext(request);
-  return json(ctx.common);
+  // The outside timer can only call the app when CRON_SECRET is set on the server.
+  return json({ ...ctx.common, timerReady: Boolean(process.env.CRON_SECRET) });
 };
 export const action = pageAction;
 
-const KEYS = ["includeKarats", "unknownOrigin", "warnChangePct"];
+const KEYS = ["includeKarats", "unknownOrigin", "warnChangePct", "auto"];
+
+const TIME_OPTIONS = Array.from({ length: 48 }, (_, i) => {
+  const t = `${String(Math.floor(i / 2)).padStart(2, "0")}:${i % 2 ? "30" : "00"}`;
+  return { label: t, value: t };
+});
+const MAX_TIMES = 4;
+
+function AutoCard({ settings, set, timeZone, timerReady }) {
+  const auto = settings.auto;
+  const setAuto = (patch) => set("auto", { ...auto, ...patch });
+  const setTime = (i, v) =>
+    setAuto({ times: auto.times.map((t, j) => (j === i ? v : t)) });
+  const nextFree = TIME_OPTIONS.find(
+    (o) => !auto.times.includes(o.value) && o.value >= "10:00",
+  )?.value;
+  return (
+    <Card>
+      <BlockStack gap="300">
+        <BlockStack gap="100">
+          <Text as="h2" variant="headingMd">
+            Automatic updates
+          </Text>
+          <Text as="p" tone="subdued">
+            Update prices to the live gold price at set times, without pressing
+            Apply.
+          </Text>
+        </BlockStack>
+        <Checkbox
+          label="Update prices automatically"
+          checked={auto.enabled}
+          onChange={(on) => setAuto({ enabled: on })}
+        />
+        {auto.enabled && (
+          <BlockStack gap="300">
+            <InlineStack gap="200" blockAlign="end">
+              {auto.times.map((t, i) => (
+                <InlineStack key={i} gap="100" blockAlign="end" wrap={false}>
+                  <Select
+                    label={i === 0 ? "Times" : `Time ${i + 1}`}
+                    labelHidden={i > 0}
+                    options={TIME_OPTIONS}
+                    value={t}
+                    onChange={(v) => setTime(i, v)}
+                  />
+                  {auto.times.length > 1 && (
+                    <Button
+                      variant="plain"
+                      tone="critical"
+                      accessibilityLabel={`Remove ${t}`}
+                      onClick={() =>
+                        setAuto({ times: auto.times.filter((_, j) => j !== i) })
+                      }
+                    >
+                      Remove
+                    </Button>
+                  )}
+                </InlineStack>
+              ))}
+              {auto.times.length < MAX_TIMES && nextFree && (
+                <Button
+                  onClick={() => setAuto({ times: [...auto.times, nextFree] })}
+                >
+                  Add a time
+                </Button>
+              )}
+            </InlineStack>
+            <Text as="p" variant="bodySm" tone="subdued">
+              Times are in your store&apos;s time zone ({timeZone}). If the live
+              price is unavailable, that update is skipped. Changes bigger than{" "}
+              {settings.warnChangePct}% are not applied: they wait for you on
+              Price Updates. Every automatic update can be undone in History.
+            </Text>
+            {!timerReady && (
+              <Text as="p" variant="bodySm" tone="caution">
+                The update timer isn&apos;t set up on the server yet, so
+                automatic updates won&apos;t run until it is.
+              </Text>
+            )}
+          </BlockStack>
+        )}
+      </BlockStack>
+    </Card>
+  );
+}
 
 function Fact({ label, value, tone }) {
   return (
@@ -148,6 +234,12 @@ export default function Settings() {
                   </InlineGrid>
                 </BlockStack>
               </Card>
+              <AutoCard
+                settings={settings}
+                set={set}
+                timeZone={data.shop.timeZone}
+                timerReady={data.timerReady}
+              />
               <SaveBar form={form} />
             </BlockStack>
           </Layout.Section>
