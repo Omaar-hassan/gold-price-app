@@ -105,6 +105,8 @@ export async function runShop(shop, admin, settings, shopInfo) {
     parts.push(
       `${held.length} price${held.length === 1 ? "" : "s"} would change by more than ${settings.warnChangePct}% and ${held.length === 1 ? "is" : "are"} waiting for you on Price Updates.`,
     );
+  if (!changes.length)
+    parts.push("All prices already match. Nothing to change.");
   return {
     status: result.errors.length ? "failed" : held.length ? "held" : "applied",
     message: parts.join(" ") || null,
@@ -147,6 +149,31 @@ async function runOne(shop, now) {
     };
   }
   await db.autoRun.update({ where: { id: row.id }, data: outcome });
+}
+
+const TIMER_KEY = "timerLastCall";
+
+/** Remember when the outside timer last called, so pages can show it is working. */
+export async function noteTimerCall() {
+  const value = new Date().toISOString();
+  try {
+    await db.appState.upsert({
+      where: { key: TIMER_KEY },
+      create: { key: TIMER_KEY, value },
+      update: { value },
+    });
+  } catch (error) {
+    console.error("[gold-price] could not note timer call:", error.message);
+  }
+}
+
+async function timerLastCall() {
+  try {
+    const row = await db.appState.findUnique({ where: { key: TIMER_KEY } });
+    return row?.value || null;
+  } catch {
+    return null;
+  }
 }
 
 /** Run every store that is due. Calls that overlap a run in progress do nothing. */
@@ -198,7 +225,10 @@ export async function recentAutoRuns(shop, take = 5) {
  * latest automatic run, and when the merchant last applied prices by hand.
  */
 export async function autoSummary(shop, settings, timeZone) {
-  const [latest] = await recentAutoRuns(shop, 1);
+  const [[latest], timerAt] = await Promise.all([
+    recentAutoRuns(shop, 1),
+    timerLastCall(),
+  ]);
   let lastManualAt = null;
   try {
     const manual = await db.priceRun.findFirst({
@@ -223,5 +253,8 @@ export async function autoSummary(shop, settings, timeZone) {
     next: next ? next.toISOString() : null,
     latest: latest || null,
     lastManualAt,
+    timerAt,
+    // No call in the last 30 minutes: the timer is probably not set up or failing.
+    timerStale: !timerAt || Date.now() - Date.parse(timerAt) > 30 * 60 * 1000,
   };
 }

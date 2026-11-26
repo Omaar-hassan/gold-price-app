@@ -5,7 +5,7 @@
 // makes the timer give up.
 import { timingSafeEqual } from "node:crypto";
 import { json } from "@remix-run/node";
-import { runDueShops } from "../lib/auto.server";
+import { noteTimerCall, runDueShops } from "../lib/auto.server";
 
 function authorized(request) {
   const secret = process.env.CRON_SECRET || "";
@@ -21,6 +21,7 @@ async function handle(request) {
     return json({ error: "CRON_SECRET is not set" }, { status: 503 });
   if (!authorized(request))
     return json({ error: "Unauthorized" }, { status: 401 });
+  await noteTimerCall();
   runDueShops().catch((error) =>
     console.error("[gold-price] automatic updates failed:", error),
   );

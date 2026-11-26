@@ -19,9 +19,12 @@ import {
   NoticeBanner,
   SaveBar,
   ShopAlerts,
+  TimerLine,
+  useShop,
   useSettingsForm,
 } from "../components/ui";
 import { loadContext, pageAction } from "../lib/pages.server";
+import { autoSummary } from "../lib/auto.server";
 import { PURITIES } from "../lib/pricing";
 
 export const meta = () => [{ title: "Settings · Gold Price Editor" }];
@@ -31,7 +34,16 @@ export const shouldRevalidate = ({ formMethod, defaultShouldRevalidate }) =>
 export const loader = async ({ request }) => {
   const ctx = await loadContext(request);
   // The outside timer can only call the app when CRON_SECRET is set on the server.
-  return json({ ...ctx.common, timerReady: Boolean(process.env.CRON_SECRET) });
+  const auto = await autoSummary(
+    ctx.shopDomain,
+    ctx.settings,
+    ctx.shopInfo.timeZone,
+  );
+  return json({
+    ...ctx.common,
+    auto,
+    timerReady: Boolean(process.env.CRON_SECRET),
+  });
 };
 export const action = pageAction;
 
@@ -43,7 +55,8 @@ const TIME_OPTIONS = Array.from({ length: 48 }, (_, i) => {
 });
 const MAX_TIMES = 4;
 
-function AutoCard({ settings, set, timeZone, timerReady }) {
+function AutoCard({ settings, set, timeZone, timerReady, summary }) {
+  const { formatDate } = useShop();
   const auto = settings.auto;
   const setAuto = (patch) => set("auto", { ...auto, ...patch });
   const setTime = (i, v) =>
@@ -108,6 +121,16 @@ function AutoCard({ settings, set, timeZone, timerReady }) {
               {settings.warnChangePct}% are not applied: they wait for you on
               Price Updates. Every automatic update can be undone in History.
             </Text>
+            {summary.enabled && (
+              <BlockStack gap="050">
+                <Text as="p" variant="bodySm">
+                  {summary.next
+                    ? `Next update: ${formatDate(summary.next)}`
+                    : "No times set."}
+                </Text>
+                {timerReady && <TimerLine auto={summary} />}
+              </BlockStack>
+            )}
             {!timerReady && (
               <Text as="p" variant="bodySm" tone="caution">
                 The update timer isn&apos;t set up on the server yet, so
@@ -239,6 +262,7 @@ export default function Settings() {
                 set={set}
                 timeZone={data.shop.timeZone}
                 timerReady={data.timerReady}
+                summary={data.auto}
               />
               <SaveBar form={form} />
             </BlockStack>
