@@ -28,7 +28,7 @@ Merchants switch these on in **Settings → Automatic updates** and pick up to 4
    - Advanced → Headers: `Authorization` = `Bearer <CRON_SECRET>`
 3. The endpoint answers `202` at once and runs every store whose time is due. Each time runs once per store. A missed time is still run up to 3 hours late; older ones are skipped.
 
-Safety: a run is skipped when the live price or exchange rate is unavailable or out of date. Changes bigger than the store's warning % are never applied automatically; they wait on Price Updates. Every automatic run appears in History and can be undone.
+Safety: a run is skipped when the live price or exchange rate is unavailable or out of date (it is tried again on the next timer calls, up to 3 times), and paused when the metal price moved more than the store's limit since the previous day (Settings, default 5%). New prices below the store's minimum price, or below the piece's metal value, are never written. Changes bigger than the store's warning % are never applied automatically; they wait on Price Updates. Every automatic run appears in History and can be undone.
 
 ---
 

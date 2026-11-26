@@ -9,7 +9,7 @@
 // - Every run is in History and can be undone like a manual one.
 import db from "../db.server";
 import { unauthenticated } from "../shopify.server";
-import { getLiveGoldPrice } from "./goldPrice.server";
+import { getLiveGoldPrice, rateJumps } from "./goldPrice.server";
 import { currencyProblem, rateProblem } from "./pages.server";
 import { buildPlan, karatPrices, PURITY_BY_KEY, toNumber } from "./pricing";
 import { dueSlot, nextSlot } from "./schedule";
@@ -18,6 +18,7 @@ import {
   fetchAllProducts,
   fetchShopInfo,
   loadSettings,
+  logActivity,
   recordRun,
 } from "./store.server";
 
@@ -78,6 +79,25 @@ export async function runShop(shop, admin, settings, shopInfo) {
   );
   const stale = livePriceProblem(changes, settings, live);
   if (stale) return { status: "skipped", message: stale };
+
+  // A sudden jump in the metal price may be a bad price feed: change nothing and
+  // let the merchant check it. Purities with a manual price don't use the feed.
+  const liveMetals = [
+    ...new Set(
+      changes
+        .filter((r) => !(Number(settings.karatOverrides?.[r.karat]) > 0))
+        .map((r) => PURITY_BY_KEY[r.karat]?.metal || r.metal || "gold"),
+    ),
+  ];
+  const jumps = await rateJumps(live, liveMetals, settings.maxRateJumpPct);
+  if (jumps.length) {
+    return {
+      status: "held",
+      heldCount: changes.length,
+      updatedCount: 0,
+      message: `${jumps.map((j) => `The ${j.metal} price moved ${j.pct > 0 ? "+" : ""}${j.pct}%`).join(" and ")} since yesterday, more than your ${settings.maxRateJumpPct}% limit, so no prices were changed automatically. If the price is right, update on Price Updates.`,
+    };
+  }
   const held = changes.filter((r) => r.flagged);
   const toApply = changes.filter((r) => !r.flagged);
 
@@ -105,7 +125,12 @@ export async function runShop(shop, admin, settings, shopInfo) {
     parts.push(
       `${held.length} price${held.length === 1 ? "" : "s"} would change by more than ${settings.warnChangePct}% and ${held.length === 1 ? "is" : "are"} waiting for you on Price Updates.`,
     );
-  if (!changes.length)
+  const belowMin = plan.skipped.filter((k) => k.belowMinimum).length;
+  if (belowMin)
+    parts.push(
+      `${belowMin} price${belowMin === 1 ? " was" : "s were"} not changed because ${belowMin === 1 ? "it is" : "they are"} below your minimum price rules (see Products).`,
+    );
+  if (!changes.length && !belowMin)
     parts.push("All prices already match. Nothing to change.");
   return {
     status: result.errors.length ? "failed" : held.length ? "held" : "applied",
@@ -114,6 +139,34 @@ export async function runShop(shop, admin, settings, shopInfo) {
     heldCount: held.length,
     runId,
   };
+}
+
+// A skipped run (price feed down, exchange rate out of date...) is tried again,
+// at most MAX_ATTEMPTS times in all, RETRY_AFTER_MS apart, while it is still due.
+const MAX_ATTEMPTS = 3;
+const RETRY_AFTER_MS = 9 * 60 * 1000;
+
+async function claimRetry(shop, slot, now) {
+  const row = await db.autoRun.findUnique({
+    where: { shop_slot: { shop, slot } },
+  });
+  if (
+    !row ||
+    row.status !== "skipped" ||
+    row.attempts >= MAX_ATTEMPTS ||
+    now - row.lastTryAt.getTime() < RETRY_AFTER_MS
+  )
+    return null;
+  // Only one caller wins the claim.
+  const claimed = await db.autoRun.updateMany({
+    where: { id: row.id, status: "skipped", attempts: row.attempts },
+    data: {
+      status: "running",
+      attempts: row.attempts + 1,
+      lastTryAt: new Date(now),
+    },
+  });
+  return claimed.count ? row : null;
 }
 
 async function runOne(shop, now) {
@@ -129,13 +182,15 @@ async function runOne(shop, now) {
   const slot = dueSlot(settings.auto.times, shopInfo.timeZone || "UTC", now);
   if (!slot) return;
 
-  // Claim this scheduled time. If the row exists, it already ran (or is running).
+  // Claim this scheduled time. If the row exists, it already ran (or is running),
+  // unless it was skipped: then it is tried again on a later timer call.
   let row;
   try {
     row = await db.autoRun.create({ data: { shop, slot } });
   } catch (error) {
-    if (error.code === "P2002") return;
-    throw error;
+    if (error.code !== "P2002") throw error;
+    row = await claimRetry(shop, slot, now);
+    if (!row) return;
   }
 
   let outcome;
@@ -149,6 +204,20 @@ async function runOne(shop, now) {
     };
   }
   await db.autoRun.update({ where: { id: row.id }, data: outcome });
+  const label = {
+    applied: outcome.updatedCount
+      ? `Updated ${outcome.updatedCount} price${outcome.updatedCount === 1 ? "" : "s"}.`
+      : "No changes needed.",
+    held: `Updated ${outcome.updatedCount || 0}, held ${outcome.heldCount || 0} for review.`,
+    skipped: "Skipped.",
+    failed: "Had problems.",
+  }[outcome.status];
+  await logActivity(
+    shop,
+    "Automatic",
+    "auto",
+    `Scheduled update: ${label}${outcome.message ? ` ${outcome.message}` : ""}`,
+  );
 }
 
 const TIMER_KEY = "timerLastCall";
@@ -213,6 +282,7 @@ export async function recentAutoRuns(shop, take = 5) {
       updatedCount: r.updatedCount,
       heldCount: r.heldCount,
       runId: r.runId,
+      attempts: r.attempts,
     }));
   } catch (error) {
     console.error("[gold-price] could not load automatic runs:", error.message);

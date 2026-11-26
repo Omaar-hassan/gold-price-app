@@ -13,7 +13,18 @@ function isThrottled(error) {
   return /THROTTLED|Throttled|429/.test(text);
 }
 
-/** admin.graphql with retry + backoff on rate limits. Returns the parsed `data`. */
+// A network blip or a Shopify server hiccup (not a GraphQL error in our query).
+// Every call the app makes is safe to repeat: queries, and mutations that set a
+// value (prices, metafields), so repeating one never doubles anything.
+function isTransient(error) {
+  if (error?.body) return false;
+  const text = `${error?.message || ""} ${error?.code || ""} ${error?.response?.status || ""}`;
+  return /fetch failed|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|socket hang up|network|\b50[234]\b/i.test(
+    text,
+  );
+}
+
+/** admin.graphql with retry + backoff on rate limits and network blips. Returns the parsed `data`. */
 export async function gql(admin, query, variables, attempt = 0) {
   try {
     const res = await admin.graphql(query, { variables });
@@ -26,6 +37,10 @@ export async function gql(admin, query, variables, attempt = 0) {
     return body.data;
   } catch (error) {
     if (isThrottled(error) && attempt < 6) {
+      await sleep(1000 * 2 ** attempt);
+      return gql(admin, query, variables, attempt + 1);
+    }
+    if (isTransient(error) && attempt < 3) {
       await sleep(1000 * 2 ** attempt);
       return gql(admin, query, variables, attempt + 1);
     }
@@ -463,7 +478,7 @@ export async function saveSettings(admin, shop, settings, currency) {
 
 export async function recordRun(shop, run) {
   try {
-    return await db.priceRun.create({
+    const created = await db.priceRun.create({
       data: {
         shop,
         kind: run.kind || "apply",
@@ -485,6 +500,30 @@ export async function recordRun(shop, run) {
         errors: run.errors.length ? JSON.stringify(run.errors) : null,
       },
     });
+    // The same changes, one row per variant, for each variant's price history.
+    if (run.updated.length) {
+      await db.priceChange
+        .createMany({
+          data: run.updated.map((u) => ({
+            shop,
+            runId: created.id,
+            kind: created.kind,
+            productId: String(u.productId || ""),
+            variantId: String(u.variantId),
+            productTitle: String(u.productTitle || ""),
+            variantTitle: String(u.variantTitle || ""),
+            oldPrice: Number(u.currentPrice) || 0,
+            newPrice: Number(u.newPrice) || 0,
+          })),
+        })
+        .catch((error) =>
+          console.error(
+            "[gold-price] could not record price history:",
+            error.message,
+          ),
+        );
+    }
+    return created;
   } catch (error) {
     // Prices were already updated in Shopify; a missing history row must not turn that into an error.
     console.error("[gold-price] could not record price run:", error.message);
@@ -566,4 +605,77 @@ export async function saveProductFix(admin, productId, variantId, fix) {
   const result = await gql(admin, FIX_SAVE, { metafields });
   const errors = result.metafieldsSet.userErrors;
   if (errors?.length) throw new Error(errors.map((e) => e.message).join(", "));
+}
+
+// ---------------------------------------------------------------------------
+// Price history per variant, and the activity log.
+// ---------------------------------------------------------------------------
+
+/** Every price the app set on one variant, newest first. */
+export async function variantHistory(shop, variantId, take = 100) {
+  try {
+    const rows = await db.priceChange.findMany({
+      where: { shop, variantId },
+      orderBy: { createdAt: "desc" },
+      take,
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      runId: r.runId,
+      kind: r.kind,
+      createdAt: r.createdAt.toISOString(),
+      productId: r.productId,
+      productTitle: r.productTitle,
+      variantTitle: r.variantTitle,
+      oldPrice: r.oldPrice,
+      newPrice: r.newPrice,
+    }));
+  } catch (error) {
+    console.error("[gold-price] could not load price history:", error.message);
+    return [];
+  }
+}
+
+export async function getPriceChange(shop, id) {
+  try {
+    return await db.priceChange.findFirst({ where: { shop, id } });
+  } catch {
+    return null;
+  }
+}
+
+/** Add a line to the activity log. Never throws: logging must not break an action. */
+export async function logActivity(shop, actor, action, summary) {
+  try {
+    await db.auditLog.create({
+      data: {
+        shop,
+        actor: String(actor || "Staff").slice(0, 100),
+        action,
+        summary: String(summary || "").slice(0, 1000),
+      },
+    });
+  } catch (error) {
+    console.error("[gold-price] could not write activity log:", error.message);
+  }
+}
+
+export async function recentActivity(shop, take = 50) {
+  try {
+    const rows = await db.auditLog.findMany({
+      where: { shop },
+      orderBy: { createdAt: "desc" },
+      take,
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      createdAt: r.createdAt.toISOString(),
+      actor: r.actor,
+      action: r.action,
+      summary: r.summary,
+    }));
+  } catch (error) {
+    console.error("[gold-price] could not load activity log:", error.message);
+    return [];
+  }
 }

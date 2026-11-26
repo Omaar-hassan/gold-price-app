@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 import { json } from "@remix-run/node";
-import { useLoaderData, useRouteError } from "@remix-run/react";
+import { Link, useLoaderData, useRouteError } from "@remix-run/react";
 import {
   Badge,
   Banner,
@@ -26,6 +26,7 @@ import {
   fetchAllProducts,
   fetchShopInfo,
   loadSettings,
+  logActivity,
   saveProductFix,
 } from "../lib/store.server";
 import {
@@ -37,6 +38,7 @@ import {
   purityLabel,
 } from "../lib/pricing";
 import { shopFormat } from "../lib/format";
+import { actorOf } from "../lib/pages.server";
 
 export const meta = () => [{ title: "Products · Gold Price Editor" }];
 
@@ -65,7 +67,7 @@ export const loader = async ({ request }) => {
 // Save the Fix form: metal + purity + origin on the product, weight on the variant,
 // as gold_price metafields. Never writes prices.
 export const action = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session, sessionToken } = await authenticate.admin(request);
   let body;
   try {
     body = await request.json();
@@ -104,6 +106,16 @@ export const action = async ({ request }) => {
 
   try {
     await saveProductFix(admin, body.productId, body.variantId, fix);
+    await logActivity(
+      session.shop,
+      actorOf(sessionToken),
+      "fix",
+      `Fixed ${String(body.productTitle || "a product").slice(0, 200)}: ${Object.entries(
+        fix,
+      )
+        .map(([k, v]) => `${k} ${v}${k === "weight" ? " g" : ""}`)
+        .join(", ")}.`,
+    );
     return json({ ok: true });
   } catch (error) {
     console.error("[gold-price] product fix failed:", error);
@@ -176,7 +188,14 @@ function FixModal({ item, onClose, onSaved }) {
   const save = async () => {
     setSaving(true);
     setError(null);
-    const payload = { productId: item.productId, variantId: item.variantId };
+    const payload = {
+      productId: item.productId,
+      variantId: item.variantId,
+      productTitle:
+        item.variantTitle && item.variantTitle !== "Default Title"
+          ? `${item.productTitle} (${item.variantTitle})`
+          : item.productTitle,
+    };
     // Only send what changed, so values found elsewhere are not copied needlessly.
     if (karat && karat !== item.karat) payload.karat = karat;
     if (origin && (origin !== item.origin || item.originGuessed))
@@ -462,13 +481,20 @@ export default function Products() {
                     </Text>
                   </IndexTable.Cell>
                   <IndexTable.Cell>
-                    <Button
-                      size="slim"
-                      variant={i.status === "skipped" ? "primary" : undefined}
-                      onClick={() => setFixing(i)}
-                    >
-                      {i.status === "skipped" ? "Fix" : "Edit"}
-                    </Button>
+                    <InlineStack gap="200" wrap={false} blockAlign="center">
+                      <Button
+                        size="slim"
+                        variant={i.status === "skipped" ? "primary" : undefined}
+                        onClick={() => setFixing(i)}
+                      >
+                        {i.status === "skipped" ? "Fix" : "Edit"}
+                      </Button>
+                      <Link
+                        to={`/app/price-history?variant=${encodeURIComponent(i.variantId)}`}
+                      >
+                        History
+                      </Link>
+                    </InlineStack>
                   </IndexTable.Cell>
                 </IndexTable.Row>
               ))}

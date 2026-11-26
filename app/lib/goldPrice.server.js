@@ -256,3 +256,43 @@ export async function recentRates(days = 14, currency = "EGP") {
     return [];
   }
 }
+
+/**
+ * How much each live metal price moved since the last price recorded on an earlier
+ * day. Returns [{ metal, pct }] for the metals in `metals` whose move is bigger than
+ * maxPct (in either direction). Compares the price per gram in the store currency,
+ * so a jump in the exchange rate counts too; falls back to the USD spot price when
+ * this currency has no earlier day yet. No earlier price at all = nothing to compare.
+ */
+export async function rateJumps(live, metals, maxPct) {
+  if (!(maxPct > 0)) return [];
+  const today = cairoDay();
+  const jumps = [];
+  for (const metal of metals) {
+    const usdNow =
+      metal === "silver" ? live.silverUsdPerOunce : live.usdPerOunce;
+    if (!(usdNow > 0)) continue;
+    try {
+      const sameCurrency = await db.metalRate.findFirst({
+        where: { metal, currency: live.currency, day: { lt: today } },
+        orderBy: { day: "desc" },
+      });
+      let pct = null;
+      if (sameCurrency && live.usdRate > 0) {
+        const now = (usdNow / 31.1034768) * live.usdRate;
+        pct = ((now - sameCurrency.egpPerGram) / sameCurrency.egpPerGram) * 100;
+      } else {
+        const any = await db.metalRate.findFirst({
+          where: { metal, day: { lt: today } },
+          orderBy: { day: "desc" },
+        });
+        if (any) pct = ((usdNow - any.usdPerOunce) / any.usdPerOunce) * 100;
+      }
+      if (pct !== null && Math.abs(pct) > maxPct)
+        jumps.push({ metal, pct: Math.round(pct * 10) / 10 });
+    } catch (error) {
+      console.error("[gold-price] could not compare rates:", error.message);
+    }
+  }
+  return jumps;
+}

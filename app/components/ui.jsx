@@ -173,10 +173,9 @@ export function usePageAction(url, onResult) {
       } catch (error) {
         console.warn("Action failed:", error);
         onResult({
-          error:
-            payload.intent === "apply" || payload.intent === "undo"
-              ? "Lost the connection to the app server. Some prices may or may not have changed: reload the page and check History before trying again."
-              : "Lost the connection to the app server. It may be waking up: please wait a few seconds and try again.",
+          error: ["apply", "undo", "restore"].includes(payload.intent)
+            ? "Lost the connection to the app server. Some prices may or may not have changed: reload the page and check History before trying again."
+            : "Lost the connection to the app server. It may be waking up: please wait a few seconds and try again.",
         });
       } finally {
         busyRef.current = false;
@@ -736,7 +735,8 @@ export function SkippedTable({ skipped }) {
 }
 
 export const runLabel = (kind) =>
-  kind === "undo" ? "Undo" : kind === "auto" ? "Automatic update" : "Update";
+  ({ undo: "Undo", auto: "Automatic update", restore: "Restore" })[kind] ||
+  "Update";
 
 /**
  * Tells the merchant when the latest automatic update needs them: big changes held
@@ -766,9 +766,11 @@ export function AutoRunBanner({ autoRun, lastManualAt, reviewAction }) {
         {autoRun.updatedCount
           ? `: ${autoRun.updatedCount} price${autoRun.updatedCount === 1 ? "" : "s"} updated. `
           : ". "}
-        {autoRun.status === "held"
-          ? "Press Preview new prices on Price Updates, check the highlighted rows, then apply the ones you want."
-          : autoRun.message}
+        {autoRun.status === "held" && !autoRun.updatedCount && autoRun.message
+          ? autoRun.message
+          : autoRun.status === "held"
+            ? "Press Preview new prices on Price Updates, check the highlighted rows, then apply the ones you want."
+            : autoRun.message}
       </p>
     </Banner>
   );
