@@ -108,6 +108,8 @@ model AutoRun {
   updatedCount Int      @default(0)
   heldCount    Int      @default(0)
   runId        Int?
+  attempts     Int      @default(1)
+  lastTryAt    DateTime @default(now())
 
   @@unique([shop, slot])
   @@index([shop, createdAt])
@@ -118,4 +120,35 @@ model AppState {
   key       String   @id
   value     String
   updatedAt DateTime @updatedAt
+}
+
+// One row per variant price the app changed (apply, automatic, undo, restore), so
+// each variant has its own price history. runId points to the PriceRun.
+model PriceChange {
+  id           Int      @id @default(autoincrement())
+  shop         String
+  runId        Int?
+  kind         String
+  createdAt    DateTime @default(now())
+  productId    String
+  variantId    String
+  productTitle String
+  variantTitle String   @default("")
+  oldPrice     Float
+  newPrice     Float
+
+  @@index([shop, variantId, createdAt])
+  @@index([shop, createdAt])
+}
+
+// Activity log: who did what, and when. actor: "Automatic" or the staff member.
+model AuditLog {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  createdAt DateTime @default(now())
+  actor     String
+  action    String
+  summary   String
+
+  @@index([shop, createdAt])
 }

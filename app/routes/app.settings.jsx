@@ -47,7 +47,15 @@ export const loader = async ({ request }) => {
 };
 export const action = pageAction;
 
-const KEYS = ["includeKarats", "unknownOrigin", "warnChangePct", "auto"];
+const KEYS = [
+  "includeKarats",
+  "unknownOrigin",
+  "warnChangePct",
+  "maxRateJumpPct",
+  "minPricePerPiece",
+  "minMetalValue",
+  "auto",
+];
 
 const TIME_OPTIONS = Array.from({ length: 48 }, (_, i) => {
   const t = `${String(Math.floor(i / 2)).padStart(2, "0")}:${i % 2 ? "30" : "00"}`;
@@ -254,7 +262,31 @@ export default function Settings() {
                       helpText="These are highlighted in red in the preview."
                       autoComplete="off"
                     />
+                    <TextField
+                      label="Pause automatic updates if gold moves more than"
+                      type="number"
+                      suffix="% in a day"
+                      value={String(settings.maxRateJumpPct)}
+                      onChange={(v) => set("maxRateJumpPct", v)}
+                      helpText="A sudden jump may be a wrong price feed. Nothing changes until you check. 0 = off."
+                      autoComplete="off"
+                    />
+                    <TextField
+                      label="Minimum price per piece"
+                      type="number"
+                      prefix={data.shop.currency}
+                      value={String(settings.minPricePerPiece)}
+                      onChange={(v) => set("minPricePerPiece", v)}
+                      helpText="New prices below this are skipped. 0 = off."
+                      autoComplete="off"
+                    />
                   </InlineGrid>
+                  <Checkbox
+                    label="Never price a piece below its metal value"
+                    helpText="Skips any new price lower than weight × price per gram, so a big discount or a formula mistake can't sell below gold cost."
+                    checked={settings.minMetalValue}
+                    onChange={(on) => set("minMetalValue", on)}
+                  />
                 </BlockStack>
               </Card>
               <AutoCard

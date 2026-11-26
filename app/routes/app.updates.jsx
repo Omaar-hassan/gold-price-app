@@ -96,6 +96,18 @@ function PreviewCard({ preview, busyIntent, busy, onDiscard, onApply }) {
                 {formatDate(preview.snapshot.at)} · {preview.productCount}{" "}
                 products scanned
               </Text>
+              {preview.rateJumps?.length > 0 && (
+                <Text as="p" variant="bodySm" tone="critical">
+                  {preview.rateJumps
+                    .map(
+                      (j) =>
+                        `The ${j.metal} price moved ${j.pct > 0 ? "+" : ""}${j.pct}% since yesterday`,
+                    )
+                    .join(" and ")}
+                  , more than your {preview.maxRateJumpPct}% limit. Check the
+                  live price is right before applying.
+                </Text>
+              )}
               {preview.vatBlocked && (
                 <Text as="p" variant="bodySm" tone="caution">
                   VAT was not added: your Shopify store adds tax at checkout.

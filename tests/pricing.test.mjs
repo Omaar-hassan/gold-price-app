@@ -368,3 +368,38 @@ test("products overview: ready, skipped with reason, and switched-off purities",
   assert.equal(by.v4.weightSource, "your fix");
   assert.deepEqual(o.counts, { all: 4, ready: 2, skipped: 1, excluded: 1 });
 });
+
+test("buildPlan skips prices below the minimum price or the metal value", () => {
+  const product = (weight) => ({
+    id: "gid://shopify/Product/9",
+    title: `Ring 21k Local ${weight}g`,
+    tags: [],
+    metafields: [],
+    variants: [{ id: `v-${weight}`, title: "", sku: "", price: "100" }],
+  });
+  const prices = (settings) =>
+    karatPrices({ usdPerOunce: 3110.34768, usdRate: 50 }, settings);
+  // 21k = 4375 / g. 1 g with making 100 = 4475.
+  const min = normalizeSettings({
+    making: { 21: { local: 100, imported: 100 } },
+    minPricePerPiece: 5000,
+    currency: "EGP",
+  });
+  const a = buildPlan([product(1), product(2)], min, prices(min));
+  assert.deepEqual(
+    a.rows.map((r) => r.newPrice),
+    [8950],
+  );
+  assert.match(a.skipped[0].reason, /below your minimum price of EGP 5,000/);
+
+  // A discount bigger than the making charge pushes the price under metal value.
+  const discount = normalizeSettings({
+    making: { 21: { local: 100, imported: 100 } },
+    discountPerPiece: 500,
+  });
+  const b = buildPlan([product(1)], discount, prices(discount));
+  assert.equal(b.rows.length, 0);
+  assert.match(b.skipped[0].reason, /below the metal value/);
+  const off = normalizeSettings({ ...discount, minMetalValue: false });
+  assert.equal(buildPlan([product(1)], off, prices(off)).rows.length, 1);
+});

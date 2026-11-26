@@ -98,6 +98,13 @@ export const DEFAULT_SETTINGS = {
   unknownOrigin: "skip",
   // Changes larger than this % are flagged in the preview.
   warnChangePct: 20,
+  // Never write a price below this per piece (store currency). 0 = off.
+  minPricePerPiece: 0,
+  // Never write a price below the piece's pure metal value (weight x price per gram).
+  minMetalValue: true,
+  // Automatic updates stop when the live metal price moved more than this % since
+  // the previous day (a possible bad price feed). 0 = off.
+  maxRateJumpPct: 5,
   // Price formulas: the 5 templates (editable) + the store's own. See app/lib/formula.js.
   formulas: TEMPLATES.map((t) => ({
     id: t.id,
@@ -202,6 +209,9 @@ export function normalizeSettings(input = {}) {
       ? s.unknownOrigin
       : "skip",
     warnChangePct: Math.max(0, toNumber(s.warnChangePct, 20)),
+    minPricePerPiece: Math.max(0, toNumber(s.minPricePerPiece, 0)),
+    minMetalValue: s.minMetalValue !== false,
+    maxRateJumpPct: Math.max(0, Math.min(100, toNumber(s.maxRateJumpPct, 5))),
     ...(() => {
       const formulas = normalizeFormulas(input.formulas);
       const active = formulas.some((f) => f.id === input.activeFormulaId)
@@ -759,6 +769,30 @@ export function buildPlan(products, settings, prices, options = {}) {
           ...base,
           origin,
           reason: "Calculated price is zero or negative",
+        });
+        continue;
+      }
+
+      // Safety floors: a price below these is never written (wrong weight, a
+      // discount that is too big, a formula typo...).
+      const amount = (n) =>
+        `${settings.currency ? `${settings.currency} ` : ""}${n.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
+      if (settings.minPricePerPiece > 0 && price < settings.minPricePerPiece) {
+        skipped.push({
+          ...base,
+          origin,
+          reason: `New price ${amount(price)} is below your minimum price of ${amount(settings.minPricePerPiece)}`,
+          belowMinimum: true,
+        });
+        continue;
+      }
+      const metalValue = gram * d.weight;
+      if (settings.minMetalValue && price < metalValue - 0.005) {
+        skipped.push({
+          ...base,
+          origin,
+          reason: `New price ${amount(price)} is below the metal value of the piece (${amount(metalValue)})`,
+          belowMinimum: true,
         });
         continue;
       }

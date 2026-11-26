@@ -3,7 +3,7 @@
 // save / preview / apply / undo. Each page's route re-exports `pageAction`.
 import { json } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
-import { getLiveGoldPrice } from "./goldPrice.server";
+import { getLiveGoldPrice, rateJumps } from "./goldPrice.server";
 import {
   applyPrices,
   claimPreview,
@@ -12,6 +12,7 @@ import {
   fetchVariantPrices,
   getRun,
   loadSettings,
+  logActivity,
   markUndone,
   recentRuns,
   recordRun,
@@ -19,7 +20,7 @@ import {
   saveSettings,
   splitByCurrentPrice,
 } from "./store.server";
-import { buildPlan, karatPrices, toNumber } from "./pricing";
+import { buildPlan, karatPrices, PURITY_BY_KEY, toNumber } from "./pricing";
 
 /**
  * What every page needs: the shop facts, saved settings and the live price in the
@@ -78,6 +79,42 @@ export function rateProblem(currency, settings, live) {
     : `The USD → ${currency} exchange rate is unavailable (${live.fx.error || "unknown error"}), so no prices were calculated. Try again later, or enter a manual exchange rate on the Metal Rates page.`;
 }
 
+/** Who did it, for the activity log. Shopify only gives the staff member's ID. */
+export function actorOf(sessionToken) {
+  const id = sessionToken?.sub;
+  return id ? `Staff member ${id}` : "Staff";
+}
+
+const SETTING_LABELS = {
+  premiumPct: "gold premium",
+  silverPremiumPct: "silver premium",
+  usdEgpOverride: "manual exchange rate",
+  karatOverrides: "manual prices per gram",
+  making: "making charges",
+  discountPerPiece: "discount",
+  rounding: "rounding",
+  includeKarats: "karats to update",
+  unknownOrigin: "products with no origin",
+  warnChangePct: "big change warning",
+  maxRateJumpPct: "price jump pause",
+  minPricePerPiece: "minimum price",
+  minMetalValue: "metal value minimum",
+  formulas: "formulas",
+  activeFormulaId: "active formula",
+  wastagePct: "wastage",
+  makingPct: "making %",
+  fixedFee: "fixed fee",
+  profitPct: "profit",
+  vat: "VAT",
+  auto: "automatic updates",
+};
+
+function changedSettings(before, after) {
+  return Object.keys(SETTING_LABELS)
+    .filter((k) => JSON.stringify(before[k]) !== JSON.stringify(after[k]))
+    .map((k) => SETTING_LABELS[k]);
+}
+
 /**
  * The action every page posts to (JSON body with `intent`):
  * - save:    { settings: patch } merged onto the saved settings (each page sends
@@ -87,8 +124,9 @@ export function rateProblem(currency, settings, live) {
  * - undo:    { runId } restores a run, skipping prices edited by hand since.
  */
 export async function pageAction({ request }) {
-  const { admin, session } = await authenticate.admin(request);
+  const { admin, session, sessionToken } = await authenticate.admin(request);
   const shop = session.shop;
+  const actor = actorOf(sessionToken);
   let body;
   try {
     body = await request.json();
@@ -98,12 +136,21 @@ export async function pageAction({ request }) {
 
   const savePatch = async (shopInfo) => {
     const stored = await loadSettings(admin, shop);
-    return saveSettings(
+    const saved = await saveSettings(
       admin,
       shop,
       { ...stored, ...(body.settings || {}) },
       shopInfo.currency,
     );
+    const changed = changedSettings(stored, saved);
+    if (changed.length)
+      await logActivity(
+        shop,
+        actor,
+        "settings",
+        `Changed ${changed.join(", ")}.`,
+      );
+    return saved;
   };
 
   try {
@@ -168,6 +215,23 @@ export async function pageAction({ request }) {
         skipped: plan.skipped,
         vatBlocked: plan.vatBlocked,
         warnChangePct: settings.warnChangePct,
+        // Shown as a warning: automatic updates would stop for this.
+        rateJumps: await rateJumps(
+          live,
+          [
+            ...new Set(
+              plan.rows
+                .filter(
+                  (r) =>
+                    !r.unchanged &&
+                    !(Number(settings.karatOverrides?.[r.karat]) > 0),
+                )
+                .map((r) => PURITY_BY_KEY[r.karat]?.metal || "gold"),
+            ),
+          ],
+          settings.maxRateJumpPct,
+        ),
+        maxRateJumpPct: settings.maxRateJumpPct,
         snapshot,
       });
     }
@@ -202,6 +266,17 @@ export async function pageAction({ request }) {
         ? await applyPrices(admin, safe)
         : { updated: [], errors: [] };
       if (result.updated.length || result.errors.length) {
+        await logActivity(
+          shop,
+          actor,
+          "apply",
+          `Applied ${result.updated.length} new price${result.updated.length === 1 ? "" : "s"}` +
+            (result.errors.length ? `, ${result.errors.length} failed` : "") +
+            (skipped.length
+              ? `, ${skipped.length} skipped (changed in Shopify)`
+              : "") +
+            ".",
+        );
         await recordRun(shop, {
           kind: "apply",
           gram24: preview.gram24,
@@ -246,8 +321,19 @@ export async function pageAction({ request }) {
       const result = safe.length
         ? await applyPrices(admin, safe)
         : { updated: [], errors: [] };
-      if (result.updated.length || result.errors.length)
+      if (result.updated.length || result.errors.length) {
         await recordRun(shop, { kind: "undo", ...result });
+        await logActivity(
+          shop,
+          actor,
+          "undo",
+          `Undid update #${run.id}: restored ${result.updated.length} price${result.updated.length === 1 ? "" : "s"}` +
+            (skipped.length
+              ? `, ${skipped.length} left alone (edited by hand)`
+              : "") +
+            ".",
+        );
+      }
       if (!result.errors.length) await markUndone(run.id);
       return json({
         intent: "undo",

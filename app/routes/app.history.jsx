@@ -21,7 +21,7 @@ import {
   useShop,
 } from "../components/ui";
 import { loadContext, pageAction } from "../lib/pages.server";
-import { getRun, recentRuns } from "../lib/store.server";
+import { getRun, recentActivity, recentRuns } from "../lib/store.server";
 import { recentAutoRuns } from "../lib/auto.server";
 
 export const meta = () => [{ title: "History · Gold Price Editor" }];
@@ -30,9 +30,10 @@ export const shouldRevalidate = ({ formMethod, defaultShouldRevalidate }) =>
 
 export const loader = async ({ request }) => {
   const ctx = await loadContext(request);
-  const [runs, autoRuns] = await Promise.all([
+  const [runs, autoRuns, activity] = await Promise.all([
     recentRuns(ctx.shopDomain, 50),
     recentAutoRuns(ctx.shopDomain, 20),
+    recentActivity(ctx.shopDomain, 100),
   ]);
   // Details of one run, when ?run=<id> is in the URL.
   const runId = Number(new URL(request.url).searchParams.get("run"));
@@ -49,7 +50,7 @@ export const loader = async ({ request }) => {
       detail = { id: run.id, kind: run.kind, changes };
     }
   }
-  return json({ shop: ctx.common.shop, runs, autoRuns, detail });
+  return json({ shop: ctx.common.shop, runs, autoRuns, activity, detail });
 };
 export const action = pageAction;
 
@@ -81,10 +82,12 @@ function RunDetail({ detail }) {
             <IndexTable.Row id={c.variantId} key={c.variantId} position={i}>
               <IndexTable.Cell>
                 <BlockStack gap="050">
-                  <Text as="span" fontWeight="semibold">
+                  <Link
+                    to={`/app/price-history?variant=${encodeURIComponent(c.variantId)}`}
+                  >
                     {c.productTitle}
-                  </Text>
-                  {c.variantTitle && (
+                  </Link>
+                  {c.variantTitle && c.variantTitle !== "Default Title" && (
                     <Text as="span" variant="bodySm" tone="subdued">
                       {c.variantTitle}
                     </Text>
@@ -173,6 +176,7 @@ export default function History() {
           onUndo={(id) => submit({ intent: "undo", runId: id })}
         />
         {data.autoRuns.length > 0 && <AutoChecks autoRuns={data.autoRuns} />}
+        <ActivityLog activity={data.activity} />
       </BlockStack>
     </AppPage>
   );
@@ -209,11 +213,61 @@ function AutoChecks({ autoRuns }) {
               {r.message && (
                 <Text as="p" variant="bodySm" tone="subdued">
                   {r.message}
+                  {r.attempts > 1 ? ` (tried ${r.attempts} times)` : ""}
                 </Text>
               )}
             </BlockStack>
           );
         })}
+      </BlockStack>
+    </Card>
+  );
+}
+
+const ACTIVITY_LABELS = {
+  settings: "Settings",
+  apply: "Prices applied",
+  undo: "Undo",
+  restore: "Price restored",
+  fix: "Product fixed",
+  auto: "Automatic",
+};
+
+// Who did what and when: settings changes, price updates, undo, restores, fixes.
+function ActivityLog({ activity }) {
+  const { formatDate } = useShop();
+  return (
+    <Card>
+      <BlockStack gap="300">
+        <BlockStack gap="050">
+          <Text as="h2" variant="headingMd">
+            Activity log
+          </Text>
+          <Text as="p" variant="bodySm" tone="subdued">
+            Who changed what, and when.
+          </Text>
+        </BlockStack>
+        {activity.length ? (
+          activity.map((a) => (
+            <BlockStack key={a.id} gap="050">
+              <InlineStack align="space-between" blockAlign="center" gap="200">
+                <Text as="span" fontWeight="semibold">
+                  {ACTIVITY_LABELS[a.action] || a.action}
+                </Text>
+                <Text as="span" variant="bodySm" tone="subdued">
+                  {formatDate(a.createdAt)} · {a.actor}
+                </Text>
+              </InlineStack>
+              <Text as="p" variant="bodySm" tone="subdued">
+                {a.summary}
+              </Text>
+            </BlockStack>
+          ))
+        ) : (
+          <Text as="p" tone="subdued">
+            Nothing yet. Changes from now on are listed here.
+          </Text>
+        )}
       </BlockStack>
     </Card>
   );
